@@ -36,7 +36,7 @@
             const path_to_root = "../../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../../searchindex-da116984.js";
+            window.path_to_searchindex_js = "../../searchindex-f2b47190.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../../toc-c8205cda.js"></script>
@@ -288,10 +288,9 @@ capacity exceeds that volume limit; setting a smaller volume limit does not
 prevent the server from starting or serving other APIs. Builder CPU, memory,
 and cache capacity are independent of the CPU and memory assigned to the
 resulting template.</p>
-<h3 id="monitor-a-build"><a class="header" href="#monitor-a-build">Monitor a Build</a></h3>
-<p><code>aenv build</code> remains connected, streams progress, and exits nonzero on failure.
-Once BuildKit succeeds, AgentENV continues importing and publishing the template
-even if the CLI is interrupted. Check its status by template name or ID:</p>
+<h2 id="monitor-a-build"><a class="header" href="#monitor-a-build">Monitor a Build</a></h2>
+<p><code>aenv pull</code> waits for the template to become ready by default. If you submit it
+with <code>--detach</code>, monitor the build by template name or ID:</p>
 <pre><code class="language-bash">aenv template watch my-template
 </code></pre>
 <p><code>aenv template watch</code> has no timeout option. Stop the local watch with <code>Ctrl-C</code>;
