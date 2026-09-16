@@ -36,7 +36,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-f2b47190.js";
+            window.path_to_searchindex_js = "../searchindex-0dffcf08.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-c8205cda.js"></script>
@@ -863,7 +863,7 @@ delete template-backed sandboxes while keeping proxy lookup state in sync.</li>
 </ul>
 <h2 id="4-end-to-end-execution-checklist"><a class="header" href="#4-end-to-end-execution-checklist">4) End-to-End Execution Checklist</a></h2>
 <ol>
-<li>Provide Firecracker binary, kernel, tools drive, overlaybd runtime, and ublk daemon. These are automatically downloaded when the server starts, or you can run <code>cargo run --bin server -- --setup-only</code> to provision runtime dependencies independently.</li>
+<li>Provide Firecracker binary, kernel, tools drive, overlaybd runtime, and ublk daemon. Host dependencies are downloaded when the server starts, or with <code>cargo run --bin server -- --setup-only</code>. Tools are prepared on launch or restore using the recorded tools version.</li>
 <li>Provision host access once as root with <code>server --setup-host --runtime-user &lt;user&gt; --runtime-group &lt;group&gt;</code>. The group is the runtime service group: it
 owns AgentENV state and receives ublk device access. Normal server startup
 performs validation only and never invokes <code>sudo</code>.</li>

@@ -37,7 +37,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-f2b47190.js";
+            window.path_to_searchindex_js = "searchindex-0dffcf08.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-c8205cda.js"></script>
@@ -3378,7 +3378,8 @@ local path overrides, not the default dependency catalog.</p>
 </table>
 </div>
 <h2 id="tools"><a class="header" href="#tools"><code>[tools]</code></a></h2>
-<p>Tools drive image used to boot the AgentENV control plane inside each microVM.</p>
+<p>Tools drive image used to boot the AgentENV control plane inside each microVM.
+The default release is selected automatically; most deployments can leave this section unchanged.</p>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -3392,11 +3393,20 @@ local path overrides, not the default dependency catalog.</p>
 </tbody>
 </table>
 </div>
-<p>Snapshots and paused sandboxes keep using the tools drive version they were
-created with. Launch does not download missing releases: operators must install
-the recorded version under <code>&lt;deps_path&gt;/tools/&lt;version&gt;/tools.ext4</code> before
-restore. Setup retains previously installed versions until they are removed
-manually.</p>
+<p>Snapshots and paused sandboxes record only <code>tools_drive_version</code>. Launch and
+restore fetch that version from the configured URL template when it is missing
+locally. Releases must be immutable and retained for the lifetime of their
+snapshots; changing the default version affects new sandboxes and templates.</p>
+<p>OCI tools rootfs images carry <code>io.agentenv.tools-drive.format=oci-rootfs-v1</code>
+(the tools Dockerfile adds it automatically). They are downloaded and converted
+locally with a stable, pinned conversion contract. Converted layers live in the
+versioned dependency directory, independently of image-cache eviction. Explicit
+<code>--setup-only</code> prepares the default release for dependency bundles.</p>
+<p>Native OverlayBD images keep lazy reads and automatically download tools layers
+in the background after envd is ready, independently of memory and user disks.
+Legacy images without the format label provide <code>tools.ext4</code>, which is downloaded
+and mounted read-only. Tools are not uploaded into snapshot storage. A local
+<code>drive_path</code> only identifies its declared version.</p>
 <h2 id="template-rootfs-images"><a class="header" href="#template-rootfs-images">Template Rootfs Images</a></h2>
 <p>User-visible rootfs images are selected at the template API layer.
 <code>POST /v2/templates/{templateID}/builds/{buildID}</code> accepts an optional
@@ -5291,7 +5301,7 @@ delete template-backed sandboxes while keeping proxy lookup state in sync.</li>
 </ul>
 <h2 id="4-end-to-end-execution-checklist"><a class="header" href="#4-end-to-end-execution-checklist">4) End-to-End Execution Checklist</a></h2>
 <ol>
-<li>Provide Firecracker binary, kernel, tools drive, overlaybd runtime, and ublk daemon. These are automatically downloaded when the server starts, or you can run <code>cargo run --bin server -- --setup-only</code> to provision runtime dependencies independently.</li>
+<li>Provide Firecracker binary, kernel, tools drive, overlaybd runtime, and ublk daemon. Host dependencies are downloaded when the server starts, or with <code>cargo run --bin server -- --setup-only</code>. Tools are prepared on launch or restore using the recorded tools version.</li>
 <li>Provision host access once as root with <code>server --setup-host --runtime-user &lt;user&gt; --runtime-group &lt;group&gt;</code>. The group is the runtime service group: it
 owns AgentENV state and receives ublk device access. Normal server startup
 performs validation only and never invokes <code>sudo</code>.</li>
