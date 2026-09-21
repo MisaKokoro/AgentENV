@@ -37,7 +37,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-af471aa2.js";
+            window.path_to_searchindex_js = "searchindex-16d24610.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-c8205cda.js"></script>
@@ -4274,6 +4274,7 @@ export E2B_API_KEY=${AENV_API_KEY}
 <p>Long-running daemon process (<code>uvm-ublk-daemon</code>) that manages all ublk devices in one process and communicates with the AgentENV node over a Unix domain socket.</p>
 <ul>
 <li>Supports RPCs for OverlayBD runtime creation for sandbox rootfs/extra drives, raw OverlayBD device creation for non-runtime callers, warm-pool acquire/release, resize capability queries, restack snapshot, delete, and shutdown.</li>
+<li>All remote image I/O (OSS/registry reads) is dispatched from the per-queue runtimes onto a dedicated per-<code>ImageService</code> remote-io runtime via <code>RuntimeDispatchFile</code> (<code>storage/overlaybd/src/io/dispatch_file.rs</code>), because opendal/reqwest pin pooled HTTP connection tasks to whatever runtime polls them and per-device runtimes are dropped on device teardown; the lazily-built remote runtime (file-cache workers, background-download scheduler) is likewise constructed and driven on that dedicated runtime so its internal <code>tokio::spawn</code> calls bind there. The runtime is created when the overlaybd global config sets <code>remoteIoWorkers</code> &gt; 0 (agentenv-generated configs emit it from <code>ublk.overlaybd.remote_io_workers</code>, default 4); with it unset/zero, remote I/O runs on the runtime that constructed the <code>ImageService</code>.</li>
 <li><code>UblkDaemonClient</code> spawns and monitors the daemon process from the node runtime.</li>
 <li><code>UblkDeviceManager</code> (<code>src/sandbox/ublk/device.rs</code>) is the node-facing singleton that delegates lifecycle operations to the daemon client; device IDs are allocated in the daemon.</li>
 </ul>
