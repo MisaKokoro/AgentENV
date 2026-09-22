@@ -3,7 +3,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
 };
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Context;
 use tokio::sync::{broadcast, oneshot, watch, Mutex, OnceCell, RwLock};
@@ -435,6 +435,7 @@ where
             extra_drives_in_snapshot,
         } = request;
         let envd_access_token = secure.then(|| self.access_tokens.generate(sandbox_id));
+        let create_start = Instant::now();
         info!(timeout = ?timeout, "creating sandbox");
 
         let result = match source {
@@ -494,14 +495,30 @@ where
                     ..Default::default()
                 };
 
-                self.launch_sandbox(LaunchPlan::for_create_from_snapshot(
-                    sandbox_id,
-                    snapshot,
-                    launch_config,
-                    transitional_metadata,
-                    NewTimeout::Set(timeout.unwrap_or(self.default_sandbox_timeout)),
-                ))
-                .await
+                let launch_start = Instant::now();
+                let launched = self
+                    .launch_sandbox(LaunchPlan::for_create_from_snapshot(
+                        sandbox_id,
+                        snapshot,
+                        launch_config,
+                        transitional_metadata,
+                        NewTimeout::Set(timeout.unwrap_or(self.default_sandbox_timeout)),
+                    ))
+                    .await;
+                info!(
+                    operation = "create_from_snapshot",
+                    stage = "launch",
+                    elapsed_ms = launch_start.elapsed().as_millis() as u64,
+                    success = launched.is_ok(),
+                    "sandbox stage elapsed"
+                );
+                info!(
+                    operation = "create_from_snapshot",
+                    elapsed_ms = create_start.elapsed().as_millis() as u64,
+                    success = launched.is_ok(),
+                    "sandbox create elapsed"
+                );
+                launched
             }
             SandboxLaunchSource::Image {
                 image_ref,

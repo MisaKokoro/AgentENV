@@ -6,7 +6,7 @@ use std::sync::{
 
 use anyhow::{anyhow, Context, Result};
 use tokio::time::{sleep, Duration};
-use tracing::{debug, trace};
+use tracing::{debug, info, trace, Instrument};
 
 use crate::sandbox::EnvdAccessToken;
 use envd::filesystem::FilesystemClient;
@@ -19,6 +19,19 @@ use envd::process::ProcessClient;
 use envd::reqwest::Client;
 
 const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
+fn is_connection_refused(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if let Some(io_error) = error.downcast_ref::<std::io::Error>() {
+            if io_error.kind() == std::io::ErrorKind::ConnectionRefused {
+                return true;
+            }
+        }
+        current = error.source();
+    }
+    false
+}
 
 // Bootstrap addresses can be reused across sandbox runtime generations. Do not
 // retain connections that may belong to the previous VM assigned the same IP.
@@ -116,24 +129,89 @@ impl EnvdInstance {
             "waiting for envd"
         );
         let start = std::time::Instant::now();
+        let mut attempt_count = 0u64;
+        let mut connection_refused_count = 0u64;
+        let mut timeout_count = 0u64;
+        let mut other_error_count = 0u64;
 
         loop {
             let elapsed = start.elapsed();
             if elapsed >= timeout {
-                return Err(anyhow!("timed out waiting for envd"));
+                info!(
+                    base_path = %self.config.base_path,
+                    stage = "envd_health_probe_summary",
+                    success = false,
+                    attempt_count,
+                    connection_refused_count,
+                    timeout_count,
+                    other_error_count,
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    "envd health probe summary"
+                );
+                return Err(anyhow!(
+                    "timed out waiting for envd after {attempt_count} health probe attempts"
+                ));
             }
 
             let remaining = timeout - elapsed;
             let probe_timeout = std::cmp::min(HEALTH_PROBE_TIMEOUT, remaining);
+            attempt_count += 1;
+            let probe_start = std::time::Instant::now();
             match tokio::time::timeout(probe_timeout, default_api::health_get(&self.config)).await {
                 Ok(Ok(_)) => {
-                    debug!(base_path = %self.config.base_path, "envd started successfully");
+                    let first_success_probe_us = probe_start.elapsed().as_micros() as u64;
+                    debug!(
+                        base_path = %self.config.base_path,
+                        attempt = attempt_count,
+                        elapsed_us = first_success_probe_us,
+                        outcome = "success",
+                        "envd health probe completed"
+                    );
+                    info!(
+                        base_path = %self.config.base_path,
+                        stage = "envd_health_probe_summary",
+                        success = true,
+                        attempt_count,
+                        connection_refused_count,
+                        timeout_count,
+                        other_error_count,
+                        first_success_probe_us,
+                        elapsed_ms = start.elapsed().as_millis() as u64,
+                        "envd health probe summary"
+                    );
+                    self.spawn_second_health_probe();
                     return Ok(());
                 }
                 Ok(Err(error)) => {
+                    let probe_elapsed_us = probe_start.elapsed().as_micros() as u64;
+                    let outcome = if is_connection_refused(&error) {
+                        connection_refused_count += 1;
+                        "connection_refused"
+                    } else {
+                        other_error_count += 1;
+                        "error"
+                    };
+                    debug!(
+                        base_path = %self.config.base_path,
+                        attempt = attempt_count,
+                        elapsed_us = probe_elapsed_us,
+                        outcome,
+                        %error,
+                        "envd health probe completed"
+                    );
                     trace!(%error, "envd health probe failed");
                 }
                 Err(_) => {
+                    timeout_count += 1;
+                    let probe_elapsed_us = probe_start.elapsed().as_micros() as u64;
+                    debug!(
+                        base_path = %self.config.base_path,
+                        attempt = attempt_count,
+                        elapsed_us = probe_elapsed_us,
+                        outcome = "timeout",
+                        timeout_us = probe_timeout.as_micros() as u64,
+                        "envd health probe completed"
+                    );
                     trace!(
                         timeout_ms = probe_timeout.as_millis(),
                         "envd health probe timed out"
@@ -143,10 +221,74 @@ impl EnvdInstance {
 
             let remaining = timeout.saturating_sub(start.elapsed());
             if remaining.is_zero() {
-                return Err(anyhow!("timed out waiting for envd"));
+                info!(
+                    base_path = %self.config.base_path,
+                    stage = "envd_health_probe_summary",
+                    success = false,
+                    attempt_count,
+                    connection_refused_count,
+                    timeout_count,
+                    other_error_count,
+                    elapsed_ms = start.elapsed().as_millis() as u64,
+                    "envd health probe summary"
+                );
+                return Err(anyhow!(
+                    "timed out waiting for envd after {attempt_count} health probe attempts"
+                ));
             }
             sleep(std::cmp::min(retry_interval, remaining)).await;
         }
+    }
+
+    fn spawn_second_health_probe(&self) {
+        let config = self.config.clone();
+        let span = tracing::Span::current();
+        tokio::spawn(
+            async move {
+                let probe_start = std::time::Instant::now();
+                match tokio::time::timeout(HEALTH_PROBE_TIMEOUT, default_api::health_get(&config))
+                    .await
+                {
+                    Ok(Ok(_)) => {
+                        info!(
+                            base_path = %config.base_path,
+                            stage = "envd_health_second_probe",
+                            success = true,
+                            elapsed_us = probe_start.elapsed().as_micros() as u64,
+                            outcome = "success",
+                            "envd second health probe completed"
+                        );
+                    }
+                    Ok(Err(error)) => {
+                        let outcome = if is_connection_refused(&error) {
+                            "connection_refused"
+                        } else {
+                            "error"
+                        };
+                        info!(
+                            base_path = %config.base_path,
+                            stage = "envd_health_second_probe",
+                            success = false,
+                            elapsed_us = probe_start.elapsed().as_micros() as u64,
+                            outcome,
+                            %error,
+                            "envd second health probe completed"
+                        );
+                    }
+                    Err(_) => {
+                        info!(
+                            base_path = %config.base_path,
+                            stage = "envd_health_second_probe",
+                            success = false,
+                            elapsed_us = probe_start.elapsed().as_micros() as u64,
+                            outcome = "timeout",
+                            "envd second health probe completed"
+                        );
+                    }
+                }
+            }
+            .instrument(span),
+        );
     }
 
     #[tracing::instrument(skip(self, env_vars))]
@@ -177,11 +319,12 @@ impl EnvdInstance {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
     use std::time::Instant;
 
     use axum::extract::State;
     use axum::http::{HeaderMap, StatusCode};
-    use axum::routing::post;
+    use axum::routing::{get, post};
     use axum::{Json, Router};
     use serde_json::Value;
     use tokio::net::TcpListener;
@@ -242,6 +385,55 @@ mod tests {
         server.abort();
         assert!(error.to_string().contains("timed out waiting for envd"));
         assert!(started.elapsed() < Duration::from_millis(500));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn readiness_issues_an_async_second_health_probe() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let handler_count = Arc::clone(&request_count);
+        let app = Router::new().route(
+            "/health",
+            get(move || {
+                let handler_count = Arc::clone(&handler_count);
+                async move {
+                    handler_count.fetch_add(1, Ordering::Relaxed);
+                    StatusCode::NO_CONTENT
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let envd = EnvdInstance::new(format!("http://{address}"), None);
+
+        envd.wait_for_ready(Duration::from_secs(1), Duration::from_millis(1))
+            .await?;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while request_count.load(Ordering::Relaxed) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .context("second health probe was not observed")?;
+
+        server.abort();
+        assert_eq!(request_count.load(Ordering::Relaxed), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn detects_connection_refused_health_errors() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        drop(listener);
+        let envd = EnvdInstance::new(format!("http://{address}"), None);
+
+        let error = default_api::health_get(&envd.config)
+            .await
+            .expect_err("closed listener should refuse the connection");
+
+        assert!(is_connection_refused(&error));
         Ok(())
     }
 
