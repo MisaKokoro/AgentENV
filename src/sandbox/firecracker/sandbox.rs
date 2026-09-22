@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
@@ -61,6 +61,38 @@ const USER_ROOTFS_DRIVE_PATH: &str = "user-rootfs";
 /// `refill_time`, not a per-second rate. Pinning the refill period to 1000 ms
 /// makes the configured `*_per_sec` values equal the sustained per-second rate.
 const RATE_LIMIT_REFILL_TIME_MS: i64 = 1000;
+const ENVD_MEMORY_PREFETCH_MIB_ENV: &str = "AENV_ENVD_MEMORY_PREFETCH_MIB";
+
+fn envd_memory_prefetch_limit_bytes() -> u64 {
+    static VALUE: OnceLock<u64> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        let Ok(raw) = std::env::var(ENVD_MEMORY_PREFETCH_MIB_ENV) else {
+            return 0;
+        };
+        let raw = raw.trim();
+        if raw.is_empty() || raw == "0" {
+            return 0;
+        }
+        if raw.eq_ignore_ascii_case("all") {
+            return u64::MAX;
+        }
+        match raw
+            .parse::<u64>()
+            .ok()
+            .and_then(|mib| mib.checked_mul(1024 * 1024))
+        {
+            Some(bytes) => bytes,
+            None => {
+                warn!(
+                    value = raw,
+                    env = ENVD_MEMORY_PREFETCH_MIB_ENV,
+                    "invalid memory prefetch size; prefetch disabled"
+                );
+                0
+            }
+        }
+    })
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 struct UblkIoStatsDelta {
@@ -2108,6 +2140,36 @@ impl FirecrackerSandbox {
             "sandbox stage elapsed"
         );
         let mem_device_path = mem_device.device_path().to_path_buf();
+        let prefetch_limit = envd_memory_prefetch_limit_bytes();
+        if prefetch_limit > 0 {
+            let prefetch_bytes = prefetch_limit.min(config.mem_virtual_size);
+            let prefetch_start = Instant::now();
+            let prefetch_result = mem_device.prefetch(prefetch_bytes).await;
+            let prefetch_elapsed_ms = prefetch_start.elapsed().as_millis() as u64;
+            match &prefetch_result {
+                Ok((stats, already_complete)) => info!(
+                    operation = "resume",
+                    stage = "memory_prefetch",
+                    elapsed_ms = prefetch_elapsed_ms,
+                    success = true,
+                    dev_id = mem_device.dev_id(),
+                    requested_bytes = prefetch_bytes,
+                    bytes_read = stats.bytes_read,
+                    already_complete,
+                    "sandbox stage elapsed"
+                ),
+                Err(error) => warn!(
+                    operation = "resume",
+                    stage = "memory_prefetch",
+                    elapsed_ms = prefetch_elapsed_ms,
+                    success = false,
+                    dev_id = mem_device.dev_id(),
+                    requested_bytes = prefetch_bytes,
+                    %error,
+                    "memory ublk prefetch failed; continuing without prefetch"
+                ),
+            }
+        }
         self.mem_snapshot_image_config_path =
             Some(config.mem_overlaybd_config.image_config_path.clone());
         self.mem_ublk_device = Some(mem_device);

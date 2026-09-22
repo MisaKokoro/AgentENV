@@ -21,6 +21,47 @@ use crate::sandbox::SandboxCaptureError;
 const UBLK_OPERATION_DURATION: &str = "agentenv_ublk_operation_duration_seconds";
 const RUNTIME_DEVICE_TIMEOUT: Duration = Duration::from_secs(360);
 const RESIZE_RPC_TIMEOUT_MARGIN: Duration = Duration::from_secs(120);
+const PREFETCH_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct MemoryPrefetchStats {
+    pub(crate) bytes_read: u64,
+}
+
+async fn prefetch_block_device(path: PathBuf, bytes: u64) -> Result<MemoryPrefetchStats> {
+    tokio::task::spawn_blocking(move || {
+        use std::fs::File;
+        use std::os::unix::fs::FileExt;
+
+        let file = File::open(&path)
+            .with_context(|| format!("open memory ublk device for prefetch: {}", path.display()))?;
+        let mut buffer = vec![0_u8; PREFETCH_CHUNK_BYTES];
+        let mut offset = 0_u64;
+        while offset < bytes {
+            let remaining = bytes - offset;
+            let read_len = usize::try_from(remaining.min(PREFETCH_CHUNK_BYTES as u64))
+                .expect("prefetch chunk length fits usize");
+            let read = file
+                .read_at(&mut buffer[..read_len], offset)
+                .with_context(|| {
+                    format!(
+                        "prefetch memory ublk device {} at offset {offset}",
+                        path.display()
+                    )
+                })?;
+            if read == 0 {
+                anyhow::bail!(
+                    "memory ublk device {} reached EOF after {offset} of {bytes} bytes",
+                    path.display()
+                );
+            }
+            offset = offset.saturating_add(read as u64);
+        }
+        Ok(MemoryPrefetchStats { bytes_read: offset })
+    })
+    .await
+    .context("join memory ublk prefetch task")?
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UblkConfig {
@@ -552,6 +593,7 @@ impl UblkDeviceManager {
             device,
             image_config_key: key.clone(),
             released: AtomicBool::new(false),
+            prefetch: OnceCell::new(),
         });
 
         // Use the entry API to avoid overwriting a live Weak inserted by a
@@ -593,6 +635,7 @@ struct SharedMemDeviceInner {
     /// Canonical key used for the shared device pool lookup.
     image_config_key: PathBuf,
     released: AtomicBool,
+    prefetch: OnceCell<MemoryPrefetchStats>,
 }
 
 impl Drop for SharedMemDeviceInner {
@@ -686,6 +729,19 @@ impl SharedMemDevice {
         self.inner.device.dev_id
     }
 
+    /// Populate the host page cache for the leading range of this shared
+    /// memory device. Concurrent users of the same device share one prefetch.
+    pub async fn prefetch(&self, bytes: u64) -> Result<(MemoryPrefetchStats, bool)> {
+        let already_complete = self.inner.prefetch.get().is_some();
+        let device_path = self.inner.device.device_path.clone();
+        let stats = self
+            .inner
+            .prefetch
+            .get_or_try_init(|| prefetch_block_device(device_path, bytes))
+            .await?;
+        Ok((*stats, already_complete))
+    }
+
     pub async fn release(self) -> Result<()> {
         if Arc::strong_count(&self.inner) != 1 {
             return Ok(());
@@ -757,6 +813,19 @@ fn record_restack_usage_stats(dev_id: u32, kind: &'static str, stats: &RestackSn
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+
+    #[tokio::test]
+    async fn prefetch_reads_requested_leading_range() {
+        let mut file = tempfile::NamedTempFile::new().expect("create temp file");
+        file.write_all(&vec![0x5a; 16 * 1024])
+            .expect("write test data");
+
+        let stats = prefetch_block_device(file.path().to_path_buf(), 8 * 1024)
+            .await
+            .expect("prefetch leading range");
+        assert_eq!(stats.bytes_read, 8 * 1024);
+    }
 
     #[test]
     fn rejects_persisted_cow_backend_with_migration_guidance() {
