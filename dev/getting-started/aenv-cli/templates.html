@@ -36,7 +36,7 @@
             const path_to_root = "../../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../../searchindex-16d24610.js";
+            window.path_to_searchindex_js = "../../searchindex-980902f7.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../../toc-c8205cda.js"></script>
@@ -199,7 +199,7 @@ aenv pull ubuntu:22.04 --name my-ubuntu
 <tr><td><code>--cpu &lt;count&gt;</code></td><td>CPU cores for the template. Defaults to <code>[machine].vcpu_count</code> on the server. Alias: <code>--cpu-count</code>.</td></tr>
 <tr><td><code>--memory &lt;MiB&gt;</code></td><td>Memory for the template. Defaults to <code>[machine].mem_size_mib</code> on the server. Aliases: <code>--memory-mb</code>, <code>--mem</code>.</td></tr>
 <tr><td><code>--start-cmd &lt;cmd&gt;</code></td><td>Shell command to run inside the sandbox before capturing the template snapshot</td></tr>
-<tr><td><code>--ready-cmd &lt;cmd&gt;</code></td><td>Shell command polled until it exits 0. Defaults to <code>sleep 20</code> when <code>--start-cmd</code> is set; otherwise unset.</td></tr>
+<tr><td><code>--ready-cmd &lt;cmd&gt;</code></td><td>Shell command polled until it exits 0. Defaults to <code>/agentenv/bin/busybox sleep 20</code> when <code>--start-cmd</code> is set; otherwise unset.</td></tr>
 <tr><td><code>--probe &lt;PORT&gt;</code></td><td>Wait until <code>localhost:&lt;PORT&gt;</code> accepts TCP connections. Conflicts with <code>--ready-cmd</code>.</td></tr>
 <tr><td><code>-d, --detach</code></td><td>Submit the build and return immediately without waiting</td></tr>
 <tr><td><code>--timeout &lt;SECS&gt;</code></td><td>Maximum seconds to wait for the build to complete. No timeout by default. Conflicts with <code>--detach</code>.</td></tr>
