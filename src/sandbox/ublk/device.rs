@@ -11,7 +11,7 @@ use tokio::sync::{Notify, OnceCell};
 use tracing::{debug, info, warn};
 use uvm_ublk_daemon::{
     CreateOverlaybdRuntimeDeviceRequest, RestackSnapshotStats, RestackSnapshotTerminalFailure,
-    UblkDaemonClient, UblkDaemonSpawnConfig,
+    UblkDaemonClient, UblkDaemonSpawnConfig, UblkIoStats,
 };
 
 use super::overlaybd::OverlaybdConfig;
@@ -293,6 +293,16 @@ impl UblkDeviceManager {
                 "failed to notify daemon of sandbox readiness; downloads start after fallback timeout"
             );
         }
+    }
+
+    pub(crate) async fn io_stats(&self, dev_ids: &[u32]) -> Result<Vec<(u32, UblkIoStats)>> {
+        let client = self.require_client()?;
+        Ok(client
+            .get_io_stats(dev_ids)
+            .await?
+            .into_iter()
+            .map(|device| (device.dev_id, device.stats))
+            .collect())
     }
 
     // ── Device lifecycle ────────────────────────────────────────────────
@@ -672,6 +682,10 @@ impl SharedMemDevice {
         self.inner.device.device_path()
     }
 
+    pub fn dev_id(&self) -> u32 {
+        self.inner.device.dev_id
+    }
+
     pub async fn release(self) -> Result<()> {
         if Arc::strong_count(&self.inner) != 1 {
             return Ok(());
@@ -703,6 +717,10 @@ pub(crate) struct UblkDevice {
 impl UblkDevice {
     pub fn device_path(&self) -> &Path {
         &self.device_path
+    }
+
+    pub fn dev_id(&self) -> u32 {
+        self.dev_id
     }
 }
 

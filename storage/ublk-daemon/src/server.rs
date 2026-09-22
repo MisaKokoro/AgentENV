@@ -24,7 +24,8 @@ use uvm_ublk::{
 };
 
 use crate::protocol::{
-    recv_message, send_message, AccessMode, DaemonRequest, DaemonResponse, ResizeToolSpec,
+    recv_message, send_message, AccessMode, DaemonRequest, DaemonResponse, DeviceIoStats,
+    ResizeToolSpec, UblkIoStats,
 };
 use crate::runtime;
 
@@ -551,6 +552,9 @@ async fn handle_connection(
             output_layer_path,
         } => handle_restack_snapshot(&devices, &pool_state, dev_id, &output_layer_path).await,
         DaemonRequest::GetFeatures => handle_get_features(&pool_state),
+        DaemonRequest::GetIoStats { dev_ids } => {
+            handle_get_io_stats(&devices, &pool_state, &dev_ids)
+        }
         DaemonRequest::NotifySandboxReady { device_key } => {
             tracing::info!(
                 device_key,
@@ -1021,6 +1025,47 @@ async fn handle_restack_snapshot(
 fn handle_get_features(pool_state: &Option<Arc<PoolState>>) -> Result<DaemonResponse> {
     let flags = pool_state.as_ref().map(|p| p.features).unwrap_or(0);
     Ok(DaemonResponse::Features { flags })
+}
+
+fn handle_get_io_stats(
+    devices: &DashMap<u32, ManagedDevice>,
+    pool_state: &Option<Arc<PoolState>>,
+    dev_ids: &[u32],
+) -> Result<DaemonResponse> {
+    let mut result = Vec::with_capacity(dev_ids.len());
+    for &dev_id in dev_ids {
+        let stats = if let Some(device) = devices.get(&dev_id) {
+            device.dev.target().io_stats()
+        } else if let Some(pool) = pool_state {
+            if let Some(active) = pool.active_exclusive.get(&dev_id) {
+                active.dev.target().io_stats()
+            } else if let Some(shared_key) = pool.shared_by_dev_id.get(&dev_id) {
+                let key = shared_key.clone();
+                drop(shared_key);
+                let active = pool
+                    .active_shared
+                    .get(&key)
+                    .with_context(|| format!("shared device {dev_id} disappeared"))?;
+                active.dev.target().io_stats()
+            } else {
+                bail!("device {dev_id} not found for I/O stats");
+            }
+        } else {
+            bail!("device {dev_id} not found for I/O stats");
+        };
+
+        result.push(DeviceIoStats {
+            dev_id,
+            stats: UblkIoStats {
+                read_ops: stats.read_ops,
+                read_bytes: stats.read_bytes,
+                read_latency_ns: stats.read_latency_ns,
+                read_max_latency_ns: stats.read_max_latency_ns,
+                read_errors: stats.read_errors,
+            },
+        });
+    }
+    Ok(DaemonResponse::IoStats { devices: result })
 }
 
 async fn handle_acquire_overlaybd(

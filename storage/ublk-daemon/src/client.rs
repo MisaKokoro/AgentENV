@@ -9,7 +9,8 @@ use tokio::time::{Duration, Instant};
 use warm_pool::PoolConfig;
 
 use crate::protocol::{
-    recv_message, send_message, AccessMode, DaemonRequest, DaemonResponse, RestackSnapshotStats,
+    recv_message, send_message, AccessMode, DaemonRequest, DaemonResponse, DeviceIoStats,
+    RestackSnapshotStats,
 };
 use overlaybd::config::UpperMode;
 
@@ -506,6 +507,20 @@ impl UblkDaemonClient {
                 bail!("daemon: get features failed: {message}")
             }
             other => bail!("daemon: unexpected response for get features: {other:?}"),
+        }
+    }
+
+    /// Snapshot monotonic read counters for active ublk devices in one RPC.
+    pub async fn get_io_stats(&self, dev_ids: &[u32]) -> Result<Vec<DeviceIoStats>> {
+        let request = DaemonRequest::GetIoStats {
+            dev_ids: dev_ids.to_vec(),
+        };
+        match self.call(request, DEFAULT_TIMEOUT).await? {
+            DaemonResponse::IoStats { devices } => Ok(devices),
+            DaemonResponse::Error { message } => {
+                bail!("daemon: get I/O stats failed: {message}")
+            }
+            other => bail!("daemon: unexpected response for get I/O stats: {other:?}"),
         }
     }
 

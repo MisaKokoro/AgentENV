@@ -10,7 +10,7 @@ use nix::libc;
 use tempfile::TempDir;
 use tracing::{debug, info, trace, warn};
 use uuid::Uuid;
-use uvm_ublk_daemon::CreateOverlaybdRuntimeDeviceRequest;
+use uvm_ublk_daemon::{CreateOverlaybdRuntimeDeviceRequest, UblkIoStats};
 
 use super::config::{
     create_firecracker_work_dir, FirecrackerCommonConfig, FirecrackerRuntimePolicy,
@@ -61,6 +61,38 @@ const USER_ROOTFS_DRIVE_PATH: &str = "user-rootfs";
 /// `refill_time`, not a per-second rate. Pinning the refill period to 1000 ms
 /// makes the configured `*_per_sec` values equal the sustained per-second rate.
 const RATE_LIMIT_REFILL_TIME_MS: i64 = 1000;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct UblkIoStatsDelta {
+    read_ops: u64,
+    read_bytes: u64,
+    read_latency_us: u64,
+    read_avg_latency_us: u64,
+    read_errors: u64,
+    cumulative_max_latency_us: u64,
+    cumulative_max_updated: bool,
+}
+
+fn ublk_io_stats_delta(before: UblkIoStats, after: UblkIoStats) -> UblkIoStatsDelta {
+    let read_ops = after.read_ops.saturating_sub(before.read_ops);
+    let read_latency_ns = after.read_latency_ns.saturating_sub(before.read_latency_ns);
+    UblkIoStatsDelta {
+        read_ops,
+        read_bytes: after.read_bytes.saturating_sub(before.read_bytes),
+        read_latency_us: read_latency_ns / 1_000,
+        read_avg_latency_us: read_latency_ns.checked_div(read_ops).unwrap_or(0) / 1_000,
+        read_errors: after.read_errors.saturating_sub(before.read_errors),
+        cumulative_max_latency_us: after.read_max_latency_ns / 1_000,
+        cumulative_max_updated: after.read_max_latency_ns > before.read_max_latency_ns,
+    }
+}
+
+fn device_io_stats(stats: &[(u32, UblkIoStats)], dev_id: Option<u32>) -> Option<UblkIoStats> {
+    let dev_id = dev_id?;
+    stats
+        .iter()
+        .find_map(|(candidate, stats)| (*candidate == dev_id).then_some(*stats))
+}
 
 fn bandwidth_bucket(
     cfg: &crate::cfg::DiskRateLimitConfig,
@@ -754,6 +786,35 @@ impl FirecrackerSandbox {
             let Some(envd_instance) = self.envd_instance.as_ref() else {
                 return Err(anyhow::anyhow!("envd instance not initialized"));
             };
+
+            let rootfs_dev_id = self
+                .rootfs_runtime
+                .as_ref()
+                .map(|runtime| runtime.device.dev_id());
+            let memory_dev_id = self.mem_ublk_device.as_ref().map(SharedMemDevice::dev_id);
+            let mut health_io_dev_ids = Vec::with_capacity(2);
+            if let Some(dev_id) = rootfs_dev_id {
+                health_io_dev_ids.push(dev_id);
+            }
+            if let Some(dev_id) = memory_dev_id {
+                if !health_io_dev_ids.contains(&dev_id) {
+                    health_io_dev_ids.push(dev_id);
+                }
+            }
+
+            let io_stats_before_start = Instant::now();
+            let io_stats_before = if health_io_dev_ids.is_empty() {
+                Ok(Vec::new())
+            } else {
+                UblkDeviceManager::global()
+                    .io_stats(&health_io_dev_ids)
+                    .await
+            };
+            let io_stats_before_us = io_stats_before_start.elapsed().as_micros() as u64;
+            if let Err(error) = &io_stats_before {
+                debug!(%error, "failed to capture ublk I/O counters before envd health wait");
+            }
+
             let envd_health_wait_start = Instant::now();
             let envd_health_wait_result = envd_instance
                 .wait_for_ready(
@@ -761,12 +822,69 @@ impl FirecrackerSandbox {
                     self.runtime_policy.envd_poll_interval,
                 )
                 .await;
+            let envd_health_wait_us = envd_health_wait_start.elapsed().as_micros() as u64;
             info!(
                 operation,
                 stage = "envd_health_wait",
-                elapsed_ms = envd_health_wait_start.elapsed().as_millis() as u64,
+                elapsed_ms = envd_health_wait_us / 1_000,
                 success = envd_health_wait_result.is_ok(),
                 "sandbox stage elapsed"
+            );
+
+            let io_stats_after_start = Instant::now();
+            let io_stats_after = if health_io_dev_ids.is_empty() {
+                Ok(Vec::new())
+            } else {
+                UblkDeviceManager::global()
+                    .io_stats(&health_io_dev_ids)
+                    .await
+            };
+            let io_stats_after_us = io_stats_after_start.elapsed().as_micros() as u64;
+            if let Err(error) = &io_stats_after {
+                debug!(%error, "failed to capture ublk I/O counters after envd health wait");
+            }
+
+            let before = io_stats_before.as_deref().unwrap_or_default();
+            let after = io_stats_after.as_deref().unwrap_or_default();
+            let rootfs_before = device_io_stats(before, rootfs_dev_id);
+            let rootfs_after = device_io_stats(after, rootfs_dev_id);
+            let memory_before = device_io_stats(before, memory_dev_id);
+            let memory_after = device_io_stats(after, memory_dev_id);
+            let rootfs_delta = rootfs_before
+                .zip(rootfs_after)
+                .map(|(before, after)| ublk_io_stats_delta(before, after))
+                .unwrap_or_default();
+            let memory_delta = memory_before
+                .zip(memory_after)
+                .map(|(before, after)| ublk_io_stats_delta(before, after))
+                .unwrap_or_default();
+            info!(
+                operation,
+                stage = "envd_health_ublk_io",
+                health_elapsed_us = envd_health_wait_us,
+                health_success = envd_health_wait_result.is_ok(),
+                io_stats_before_us,
+                io_stats_after_us,
+                rootfs_dev_id = ?rootfs_dev_id,
+                rootfs_stats_available = rootfs_before.is_some() && rootfs_after.is_some(),
+                rootfs_read_ops = rootfs_delta.read_ops,
+                rootfs_read_bytes = rootfs_delta.read_bytes,
+                rootfs_read_latency_us = rootfs_delta.read_latency_us,
+                rootfs_read_avg_latency_us = rootfs_delta.read_avg_latency_us,
+                rootfs_read_errors = rootfs_delta.read_errors,
+                rootfs_read_cumulative_max_latency_us = rootfs_delta.cumulative_max_latency_us,
+                rootfs_read_cumulative_max_updated = rootfs_delta.cumulative_max_updated,
+                memory_dev_id = ?memory_dev_id,
+                memory_device_shared = memory_dev_id.is_some(),
+                memory_stats_available = memory_before.is_some() && memory_after.is_some(),
+                memory_read_ops = memory_delta.read_ops,
+                memory_read_bytes = memory_delta.read_bytes,
+                memory_read_latency_us = memory_delta.read_latency_us,
+                memory_read_avg_latency_us = memory_delta.read_avg_latency_us,
+                memory_read_errors = memory_delta.read_errors,
+                memory_read_cumulative_max_latency_us = memory_delta.cumulative_max_latency_us,
+                memory_read_cumulative_max_updated = memory_delta.cumulative_max_updated,
+                "envd health wait ublk I/O delta"
             );
             envd_health_wait_result?;
 
@@ -2517,6 +2635,33 @@ mod tests {
     use crate::sandbox::{SandboxAccessTokenGenerator, SandboxExecutor};
     use crate::snapshot::{CommittedSnapshot, RunnableSnapshot, SnapshotRecord};
     use std::collections::HashMap;
+
+    #[test]
+    fn ublk_io_stats_delta_is_non_overlapping() {
+        let before = UblkIoStats {
+            read_ops: 10,
+            read_bytes: 40_960,
+            read_latency_ns: 1_000_000,
+            read_max_latency_ns: 300_000,
+            read_errors: 1,
+        };
+        let after = UblkIoStats {
+            read_ops: 14,
+            read_bytes: 57_344,
+            read_latency_ns: 1_900_000,
+            read_max_latency_ns: 500_000,
+            read_errors: 2,
+        };
+
+        let delta = ublk_io_stats_delta(before, after);
+        assert_eq!(delta.read_ops, 4);
+        assert_eq!(delta.read_bytes, 16_384);
+        assert_eq!(delta.read_latency_us, 900);
+        assert_eq!(delta.read_avg_latency_us, 225);
+        assert_eq!(delta.read_errors, 1);
+        assert_eq!(delta.cumulative_max_latency_us, 500);
+        assert!(delta.cumulative_max_updated);
+    }
 
     fn fresh_config() -> FirecrackerSandboxConfig {
         FirecrackerSandboxConfig::new(

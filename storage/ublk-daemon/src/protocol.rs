@@ -49,6 +49,10 @@ pub enum DaemonRequest {
     },
     /// Query daemon capabilities (e.g., dynamic resize support).
     GetFeatures,
+    /// Snapshot monotonic read counters for multiple active devices.
+    GetIoStats {
+        dev_ids: Vec<u32>,
+    },
     /// Report that the sandbox owning a memory-snapshot device finished
     /// booting (envd ready), releasing its held background downloads.
     /// `device_key` is the image.json path the device was opened with.
@@ -122,6 +126,9 @@ pub enum DaemonResponse {
     Features {
         flags: u64,
     },
+    IoStats {
+        devices: Vec<DeviceIoStats>,
+    },
     Deleted,
     RestackSnapshotCreated {
         descriptor: Option<LayerDescriptor>,
@@ -153,6 +160,21 @@ pub struct RestackSnapshotStats {
     pub descriptor: Option<LayerDescriptor>,
     pub data_stat: Option<DataStat>,
     pub ext4_used_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UblkIoStats {
+    pub read_ops: u64,
+    pub read_bytes: u64,
+    pub read_latency_ns: u64,
+    pub read_max_latency_ns: u64,
+    pub read_errors: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceIoStats {
+    pub dev_id: u32,
+    pub stats: UblkIoStats,
 }
 
 /// Send a length-prefixed JSON message over a Unix stream.
@@ -297,6 +319,42 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         let decoded: DaemonRequest = serde_json::from_str(&json).unwrap();
         assert!(matches!(decoded, DaemonRequest::GetFeatures));
+    }
+
+    #[test]
+    fn io_stats_request_and_response_round_trip() {
+        let request = DaemonRequest::GetIoStats {
+            dev_ids: vec![3, 7],
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        let decoded: DaemonRequest = serde_json::from_str(&json).unwrap();
+        match decoded {
+            DaemonRequest::GetIoStats { dev_ids } => assert_eq!(dev_ids, vec![3, 7]),
+            _ => panic!("unexpected variant"),
+        }
+
+        let response = DaemonResponse::IoStats {
+            devices: vec![DeviceIoStats {
+                dev_id: 3,
+                stats: UblkIoStats {
+                    read_ops: 2,
+                    read_bytes: 8192,
+                    read_latency_ns: 123_000,
+                    read_max_latency_ns: 80_000,
+                    read_errors: 1,
+                },
+            }],
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        let decoded: DaemonResponse = serde_json::from_str(&json).unwrap();
+        match decoded {
+            DaemonResponse::IoStats { devices } => {
+                assert_eq!(devices.len(), 1);
+                assert_eq!(devices[0].dev_id, 3);
+                assert_eq!(devices[0].stats.read_bytes, 8192);
+            }
+            _ => panic!("unexpected variant"),
+        }
     }
 
     #[test]

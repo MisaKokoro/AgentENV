@@ -707,6 +707,15 @@ mod client_tests {
                 },
                 DaemonRequest::Shutdown => DaemonResponse::Ok,
                 DaemonRequest::GetFeatures => DaemonResponse::Features { flags: 0 },
+                DaemonRequest::GetIoStats { dev_ids } => DaemonResponse::IoStats {
+                    devices: dev_ids
+                        .into_iter()
+                        .map(|dev_id| uvm_ublk_daemon::DeviceIoStats {
+                            dev_id,
+                            stats: uvm_ublk_daemon::UblkIoStats::default(),
+                        })
+                        .collect(),
+                },
                 DaemonRequest::AcquireOverlaybd { .. } => DaemonResponse::DeviceAcquired {
                     dev_id: 99,
                     device_path: PathBuf::from("/dev/ublkb99"),
@@ -733,12 +742,13 @@ mod client_tests {
             .await
             .unwrap();
         client.delete(30).await.unwrap();
+        client.get_io_stats(&[10, 20]).await.unwrap();
         client
             .restack_snapshot(40, Path::new("/snap/output"))
             .await
             .unwrap();
         let requests = captured.lock().unwrap();
-        assert_eq!(requests.len(), 3);
+        assert_eq!(requests.len(), 4);
 
         assert!(requests[0].contains("CreateOverlaybd"));
         assert!(requests[0].contains("img.json"));
@@ -748,9 +758,13 @@ mod client_tests {
         assert!(requests[1].contains("Delete"));
         assert!(requests[1].contains("30"));
 
-        assert!(requests[2].contains("RestackSnapshot"));
-        assert!(requests[2].contains("40"));
-        assert!(requests[2].contains("output"));
+        assert!(requests[2].contains("GetIoStats"));
+        assert!(requests[2].contains("10"));
+        assert!(requests[2].contains("20"));
+
+        assert!(requests[3].contains("RestackSnapshot"));
+        assert!(requests[3].contains("40"));
+        assert!(requests[3].contains("output"));
     }
 }
 

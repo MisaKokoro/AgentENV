@@ -9,7 +9,9 @@ use std::fmt;
 use std::io::ErrorKind;
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 use storage_util::io_ring::AsyncIoRing;
 
 use crate::{IOBuffer, UVMUblkTarget, UblkDescOperation};
@@ -46,6 +48,59 @@ pub struct OverlaybdTargetConfig {
 
 pub struct OverlaybdTarget {
     state: ArcSwap<TargetState>,
+    io_stats: OverlaybdIoCounters,
+}
+
+/// Monotonic per-device read counters used for short-window boot diagnostics.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OverlaybdIoStats {
+    pub read_ops: u64,
+    pub read_bytes: u64,
+    pub read_latency_ns: u64,
+    pub read_max_latency_ns: u64,
+    pub read_errors: u64,
+}
+
+#[derive(Default)]
+struct OverlaybdIoCounters {
+    read_ops: AtomicU64,
+    read_bytes: AtomicU64,
+    read_latency_ns: AtomicU64,
+    read_max_latency_ns: AtomicU64,
+    read_errors: AtomicU64,
+}
+
+impl OverlaybdIoCounters {
+    fn snapshot(&self) -> OverlaybdIoStats {
+        OverlaybdIoStats {
+            read_ops: self.read_ops.load(Ordering::Relaxed),
+            read_bytes: self.read_bytes.load(Ordering::Relaxed),
+            read_latency_ns: self.read_latency_ns.load(Ordering::Relaxed),
+            read_max_latency_ns: self.read_max_latency_ns.load(Ordering::Relaxed),
+            read_errors: self.read_errors.load(Ordering::Relaxed),
+        }
+    }
+
+    fn record_read(&self, bytes: u64, elapsed_ns: u64, success: bool) {
+        self.read_ops.fetch_add(1, Ordering::Relaxed);
+        if success {
+            self.read_bytes.fetch_add(bytes, Ordering::Relaxed);
+        } else {
+            self.read_errors.fetch_add(1, Ordering::Relaxed);
+        }
+        self.read_latency_ns
+            .fetch_add(elapsed_ns, Ordering::Relaxed);
+        self.read_max_latency_ns
+            .fetch_max(elapsed_ns, Ordering::Relaxed);
+    }
+
+    fn reset(&self) {
+        self.read_ops.store(0, Ordering::Relaxed);
+        self.read_bytes.store(0, Ordering::Relaxed);
+        self.read_latency_ns.store(0, Ordering::Relaxed);
+        self.read_max_latency_ns.store(0, Ordering::Relaxed);
+        self.read_errors.store(0, Ordering::Relaxed);
+    }
 }
 
 impl fmt::Debug for OverlaybdTarget {
@@ -120,7 +175,12 @@ impl OverlaybdTarget {
 
         Ok(Self {
             state: ArcSwap::new(Arc::new(state)),
+            io_stats: OverlaybdIoCounters::default(),
         })
+    }
+
+    pub fn io_stats(&self) -> OverlaybdIoStats {
+        self.io_stats.snapshot()
     }
 
     /// Swap the target's backing image and capacity atomically.
@@ -155,6 +215,7 @@ impl OverlaybdTarget {
         };
 
         self.state.store(Arc::new(new_state));
+        self.io_stats.reset();
         Ok(())
     }
 
@@ -352,10 +413,15 @@ impl UVMUblkTarget for OverlaybdTarget {
 
         let ctx = IoCtx::new(io_ring);
         let result: Result<i32> = match op {
-            UblkDescOperation::Read => self
-                .handle_read(&state, ctx, offset, len, buf)
-                .await
-                .map(|n| n as i32),
+            UblkDescOperation::Read => {
+                let started = Instant::now();
+                let result = self.handle_read(&state, ctx, offset, len, buf).await;
+                let elapsed_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                let completed_bytes = result.as_ref().copied().unwrap_or(0) as u64;
+                self.io_stats
+                    .record_read(completed_bytes, elapsed_ns, result.is_ok());
+                result.map(|n| n as i32)
+            }
             UblkDescOperation::Write => self
                 .handle_write(&state, ctx, offset, len, buf)
                 .await
@@ -391,7 +457,8 @@ impl UVMUblkTarget for OverlaybdTarget {
 #[cfg(test)]
 mod tests {
     use super::{
-        anyhow_to_ublk_errno, build_ublk_params, validate_block_size_shift, OverlaybdTarget,
+        anyhow_to_ublk_errno, build_ublk_params, validate_block_size_shift, OverlaybdIoCounters,
+        OverlaybdIoStats, OverlaybdTarget,
     };
     use crate::{IOBuffer, UVMUblkTarget, UserBuffer};
     use overlaybd::config::UpperMode;
@@ -403,6 +470,26 @@ mod tests {
     use storage_util::io_ring::AsyncIoRingBuilder;
     use tempfile::TempDir;
     use ublk_sys::ublksrv_io_desc;
+
+    #[test]
+    fn io_counters_snapshot_and_reset() {
+        let counters = OverlaybdIoCounters::default();
+        counters.record_read(4096, 50_000, true);
+        counters.record_read(0, 80_000, false);
+        assert_eq!(
+            counters.snapshot(),
+            OverlaybdIoStats {
+                read_ops: 2,
+                read_bytes: 4096,
+                read_latency_ns: 130_000,
+                read_max_latency_ns: 80_000,
+                read_errors: 1,
+            }
+        );
+
+        counters.reset();
+        assert_eq!(counters.snapshot(), OverlaybdIoStats::default());
+    }
 
     #[test]
     fn test_overlaybd_block_size_shift_validation() {
