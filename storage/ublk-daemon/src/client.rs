@@ -10,7 +10,7 @@ use warm_pool::PoolConfig;
 
 use crate::protocol::{
     recv_message, send_message, AccessMode, DaemonRequest, DaemonResponse, PackRecordingState,
-    RestackSnapshotStats,
+    RestackSnapshotStats, StartupPackSource,
 };
 use overlaybd::config::UpperMode;
 
@@ -460,7 +460,7 @@ impl UblkDaemonClient {
         &self,
         image_config: &Path,
         global_config: &Path,
-        url: &str,
+        source: StartupPackSource,
         pack_size: u64,
         index_sha256: &str,
         mem_virtual_size: u64,
@@ -469,7 +469,7 @@ impl UblkDaemonClient {
         let request = DaemonRequest::PrefetchStartupPack {
             image_config: image_config.to_path_buf(),
             global_config: global_config.to_path_buf(),
-            url: url.to_string(),
+            source,
             pack_size,
             index_sha256: index_sha256.to_string(),
             mem_virtual_size,

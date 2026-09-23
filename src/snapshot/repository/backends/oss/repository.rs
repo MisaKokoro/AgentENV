@@ -1905,67 +1905,8 @@ async fn build_and_upload_manifest(
         .snapshot
         .memory_startup_pack;
     let build = async {
-        let trace = match tokio::fs::read(trace_path).await {
-            Ok(trace) => trace,
-            Err(error) => {
-                if error.kind() != std::io::ErrorKind::NotFound {
-                    debug!(
-                        %error,
-                        snapshot_id = %id,
-                        "read startup trace failed; publishing without a manifest"
-                    );
-                }
-                return None;
-            }
-        };
-        let (mem_virtual_size, offsets) = match overlaybd::startup_pack::decode_trace(&trace) {
-            Ok(decoded) => decoded,
-            Err(error) => {
-                warn!(
-                    %error,
-                    snapshot_id = %id,
-                    "startup trace undecodable; publishing without a manifest"
-                );
-                return None;
-            }
-        };
-        let manifest_doc =
-            match overlaybd::startup_manifest::build_manifest(mem_virtual_size, &offsets) {
-                Ok(doc) => doc,
-                Err(error) => {
-                    warn!(
-                        %error,
-                        snapshot_id = %id,
-                        "build startup manifest failed (best-effort)"
-                    );
-                    return None;
-                }
-            };
-        let manifest_bytes = match overlaybd::startup_manifest::encode_manifest(&manifest_doc) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                warn!(
-                    %error,
-                    snapshot_id = %id,
-                    "encode startup manifest failed (best-effort)"
-                );
-                return None;
-            }
-        };
-        info!(
-            snapshot_id = %id,
-            pages = offsets.len(),
-            prefix_pages = manifest_doc.prefix_pages.len(),
-            ranges = manifest_doc.ranges.len(),
-            manifest_bytes = manifest_bytes.len(),
-            "startup manifest built"
-        );
-
-        let info = MemoryStartupPackInfo {
-            pack_size: manifest_bytes.len() as u64,
-            mem_virtual_size,
-            index_sha256: crate::snapshot::startup_pack::hex_sha256(&manifest_bytes),
-        };
+        let (manifest_bytes, info) =
+            crate::snapshot::startup_pack::build_manifest_from_trace(id, trace_path).await?;
         if let Err(error) = client
             .put_bytes(
                 &layout.artifact_key(MEMORY_STARTUP_PACK_ARTIFACT),

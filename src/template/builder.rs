@@ -132,10 +132,9 @@ impl TemplateBuilder {
 
         info!("publishing template snapshot");
         // Best-effort: spawn the startup-manifest recording now so the
-        // throwaway recording VM overlaps the backend's layer uploads (a
-        // no-op task when the feature is disabled or the backend carries no
-        // capture payload); a detached continuation uploads the manifest once
-        // the trace lands.
+        // throwaway recording VM overlaps backend publication (a no-op task
+        // when the feature is disabled or the backend carries no capture
+        // payload). The backend chooses detached or joined finalization.
         let recording = build_execution
             .capture_artifacts
             .and_then(|artifacts| {

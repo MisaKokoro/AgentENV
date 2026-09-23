@@ -27,7 +27,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 const DEFAULT_BLOCK_SIZE: u32 = 512;
-const IO_ENGINE_LIBAIO: u32 = 2;
+pub(super) const IO_ENGINE_LIBAIO: u32 = 2;
 
 struct OpenedLowerLayer {
     file: Arc<dyn VirtualFile>,

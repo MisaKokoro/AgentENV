@@ -12,8 +12,8 @@ use serde::Serialize;
 use super::layout::PosixFsSnapshotArtifactLayout;
 use crate::snapshot::repository::{SnapshotListFilter, VolumeRecordPage};
 use crate::snapshot::{
-    CommittedSnapshot, RepositoryError, RepositoryResult, SnapshotAlias, SnapshotId,
-    SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord, SnapshotSource,
+    CommittedSnapshot, MemoryStartupPackInfo, RepositoryError, RepositoryResult, SnapshotAlias,
+    SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord, SnapshotSource,
     SnapshotSourceKind, TemplateBuildErrorReason, TemplateBuildInfo, TemplateBuildStatus,
 };
 use crate::volume::{is_valid_volume_component, VolumeMode, VolumeRecord};
@@ -732,6 +732,32 @@ impl PosixFsCatalogStore {
         build.error_reason = Some(reason);
         record.updated_at_unix_ms = now;
         self.write_record_unlocked(&record)
+    }
+
+    /// Attach a successfully persisted startup manifest to a committed
+    /// snapshot under the record lock.
+    pub(crate) fn attach_memory_startup(
+        &self,
+        id: &SnapshotId,
+        info: MemoryStartupPackInfo,
+    ) -> RepositoryResult<SnapshotRecord> {
+        let _guard = self.acquire_record_lock(id)?;
+        let mut record = self.load_record_by_id_unlocked(id)?.ok_or_else(|| {
+            RepositoryError::SnapshotNotFound {
+                lookup: id.to_string(),
+            }
+        })?;
+        let committed =
+            record
+                .committed
+                .as_mut()
+                .ok_or_else(|| RepositoryError::InvalidRequest {
+                    reason: format!("snapshot '{id}' is not committed"),
+                })?;
+        committed.memory_startup = Some(info);
+        record.updated_at_unix_ms = now_unix_ms();
+        self.write_record_unlocked(&record)?;
+        Ok(record)
     }
 
     fn read_json<T>(&self, path: &Path) -> RepositoryResult<T>

@@ -93,13 +93,27 @@ impl SnapshotRuntimeResolver for PosixFsRuntimeResolver {
         let attached_drives = self
             .resolve_attached_drives(&snapshot_id, committed, &mut handles)
             .await?;
-        let runtime_manifest = hydrate_runtime_manifest(
+        let mut runtime_manifest = hydrate_runtime_manifest(
             committed_manifest,
             vm_state_path,
             mem_image_config_path,
             rootfs_image_config_path,
             &attached_drives,
         )?;
+        runtime_manifest.memory_startup_pack =
+            crate::snapshot::startup_pack::resolve_startup_pack_ref(
+                committed.memory_startup.as_ref(),
+                crate::cfg::ConfigManager::global_config()
+                    .snapshot
+                    .memory_startup_pack
+                    .consume_enabled,
+                || {
+                    crate::snapshot::StartupPackLocation::LocalPath(
+                        self.snapshot_layout(&snapshot_id)
+                            .path(crate::snapshot::MEMORY_STARTUP_PACK_ARTIFACT),
+                    )
+                },
+            );
         // Runtime artifacts are protected by the sandbox start-window lease (over
         // local-only commits) + the orchestrator running set; the resolved-handle
         // needs no separate local image ref pin.

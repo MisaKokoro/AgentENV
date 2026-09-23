@@ -205,9 +205,8 @@ impl SnapshotRuntimeResolver for OssRuntimeResolver {
             &attached_drives,
         )?;
 
-        // Runtime-only startup pack reference: v2 packs only, and only when
-        // consumption is enabled on this node. Everything else resumes
-        // on-demand as before.
+        // Runtime-only startup manifest reference, only when consumption is
+        // enabled on this node. Everything else resumes on-demand as before.
         runtime_manifest.memory_startup_pack =
             crate::snapshot::startup_pack::resolve_startup_pack_ref(
                 committed.memory_startup.as_ref(),
@@ -215,7 +214,11 @@ impl SnapshotRuntimeResolver for OssRuntimeResolver {
                     .snapshot
                     .memory_startup_pack
                     .consume_enabled,
-                || self.client.startup_pack_url(&id),
+                || {
+                    crate::snapshot::StartupPackLocation::RemoteUrl(
+                        self.client.startup_pack_url(&id),
+                    )
+                },
             );
 
         let runnable = RunnableSnapshot::new((*snapshot).clone(), runtime_manifest, cache_lease);

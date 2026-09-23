@@ -4,6 +4,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 use tokio::task;
+use tracing::{debug, info, warn};
 
 use super::super::{common::materialize_volume_image_config, shared_runtime_cache_root};
 use super::artifacts::{CollectedBuiltArtifacts, PosixFsArtifactStore};
@@ -256,13 +257,29 @@ impl SnapshotRepository for PosixFsSnapshotRepository {
         &self,
         metadata: SnapshotPublishMetadata,
         manifest: SandboxSnapshotManifest,
-        _recording: Option<crate::snapshot::StartupRecording>,
+        recording: Option<crate::snapshot::StartupRecording>,
     ) -> RepositoryResult<SnapshotRecord> {
+        let snapshot_id = metadata.id.clone();
         let repository = self.clone();
-        run_repository_blocking("publish snapshot", move || {
+        let record = run_repository_blocking("publish snapshot", move || {
             repository.publish_sync(metadata, manifest)
         })
-        .await
+        .await?;
+
+        if crate::cfg::ConfigManager::global_config()
+            .snapshot
+            .memory_startup_pack
+            .enabled
+        {
+            if let Some(recording) = recording {
+                if let Some(updated) =
+                    finish_posix_startup_manifest(self.clone(), snapshot_id, recording).await
+                {
+                    return Ok(updated);
+                }
+            }
+        }
+        Ok(record)
     }
 
     async fn get(&self, id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>> {
@@ -454,6 +471,64 @@ impl SnapshotRepository for PosixFsSnapshotRepository {
     }
 }
 
+/// Join the already-running recorder before POSIX publish returns, then store
+/// the manifest and attach its descriptor. Recording failure is deliberately
+/// best-effort: the committed snapshot remains usable through demand paging.
+async fn finish_posix_startup_manifest(
+    repository: PosixFsSnapshotRepository,
+    id: SnapshotId,
+    recording: crate::snapshot::StartupRecording,
+) -> Option<SnapshotRecord> {
+    let crate::snapshot::StartupRecording { trace, keep_alive } = recording;
+    let _keep_alive = keep_alive;
+    let trace_path = match trace.await {
+        Ok(Some(path)) => path,
+        Ok(None) => {
+            debug!(snapshot_id = %id, "startup manifest recording produced no trace");
+            return None;
+        }
+        Err(error) => {
+            warn!(%error, snapshot_id = %id, "startup manifest recording join failed");
+            return None;
+        }
+    };
+    let (manifest_bytes, info) =
+        crate::snapshot::startup_pack::build_manifest_from_trace(&id, &trace_path).await?;
+    let task_id = id.clone();
+    match task::spawn_blocking(move || {
+        let manifest_path = repository
+            .artifact_store
+            .store_startup_manifest(&task_id, &manifest_bytes)?;
+        let attached = repository
+            .catalog_store
+            .attach_memory_startup(&task_id, info);
+        if attached.is_err() {
+            let _ = std::fs::remove_file(&manifest_path);
+            if let Some(parent) = manifest_path.parent() {
+                // Removes only an empty directory; never touches surviving
+                // snapshot artifacts from a concurrent operation.
+                let _ = std::fs::remove_dir(parent);
+            }
+        }
+        attached
+    })
+    .await
+    {
+        Ok(Ok(record)) => {
+            info!(snapshot_id = %id, "POSIX startup manifest stored");
+            Some(record)
+        }
+        Ok(Err(error)) => {
+            warn!(%error, snapshot_id = %id, "store POSIX startup manifest failed (best-effort)");
+            None
+        }
+        Err(error) => {
+            warn!(%error, snapshot_id = %id, "POSIX startup manifest task failed to join");
+            None
+        }
+    }
+}
+
 async fn run_repository_blocking<T, F>(operation: &'static str, work: F) -> RepositoryResult<T>
 where
     T: Send + 'static,
@@ -486,9 +561,9 @@ mod tests {
         RepositoryError, SnapshotRepository, SnapshotRuntimeResolver,
     };
     use crate::snapshot::{
-        CommittedSnapshot, ManagedLayer, OverlaybdLayerRef, SnapshotAlias, SnapshotId,
-        SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord, SnapshotSource,
-        TemplateBuildErrorReason, SNAPSHOT_ARTIFACT_LAYOUT,
+        CommittedSnapshot, ManagedLayer, MemoryStartupPackInfo, OverlaybdLayerRef, SnapshotAlias,
+        SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord, SnapshotSource,
+        TemplateBuildErrorReason, MEMORY_STARTUP_PACK_ARTIFACT, SNAPSHOT_ARTIFACT_LAYOUT,
     };
 
     use super::super::artifacts::PosixFsArtifactStore;
@@ -625,6 +700,46 @@ mod tests {
         .expect("parse overlaybd image config");
         assert_eq!(image_config.repo_blob_url, "");
         assert_eq!(image_config.lowers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stores_posix_startup_manifest_and_attaches_descriptor() {
+        let tempdir = TempDir::new().expect("tempdir should exist");
+        let repository = test_repository(tempdir.path());
+        let snapshot_id = SnapshotId::generate();
+        let manifest = seed_built_snapshot(tempdir.path());
+        repository
+            .publish(sample_metadata(snapshot_id.clone(), None), manifest, None)
+            .await
+            .expect("publish should work");
+
+        let bytes = b"startup-manifest";
+        let path = repository
+            .artifact_store
+            .store_startup_manifest(&snapshot_id, bytes)
+            .expect("store startup manifest");
+        assert_eq!(path.file_name().unwrap(), MEMORY_STARTUP_PACK_ARTIFACT);
+        assert_eq!(fs::read(&path).expect("read startup manifest"), bytes);
+
+        let info = MemoryStartupPackInfo {
+            pack_size: bytes.len() as u64,
+            mem_virtual_size: 1 << 30,
+            index_sha256: "ab".repeat(32),
+        };
+        let updated = repository
+            .catalog_store
+            .attach_memory_startup(&snapshot_id, info.clone())
+            .expect("attach descriptor");
+        assert_eq!(
+            updated.committed.unwrap().memory_startup,
+            Some(info.clone())
+        );
+        let fetched = repository
+            .get(&snapshot_id.to_string())
+            .await
+            .expect("get snapshot")
+            .expect("snapshot exists");
+        assert_eq!(fetched.committed.unwrap().memory_startup, Some(info));
     }
 
     #[tokio::test]

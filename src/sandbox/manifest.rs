@@ -50,9 +50,9 @@ pub struct SandboxSnapshotManifest {
     /// Launch-time volumes use the reserved slots that follow these drives.
     #[serde(default)]
     pub physical_extra_drive_count: usize,
-    /// Runtime-only startup pack reference resolved from the committed
-    /// record (OSS backend, consumption enabled). Absent for older
-    /// snapshots, v1 packs, POSIX backends, and disabled consumption.
+    /// Runtime-only startup manifest reference resolved from the committed
+    /// record when consumption is enabled. Absent for older snapshots,
+    /// unsupported manifest versions, and disabled consumption.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_startup_pack: Option<crate::snapshot::ResolvedStartupPack>,
 }

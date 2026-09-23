@@ -1,7 +1,9 @@
 use std::fmt;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::backend::cache::{
@@ -20,6 +22,7 @@ use crate::io::dispatch_file::{build_remote_io_runtime, RuntimeDispatchFile};
 use crate::io::virtual_file::VirtualFile;
 use crate::lsmt::file::CommitArgs;
 use anyhow::{bail, Context, Result};
+use dashmap::DashSet;
 use tokio::sync::OnceCell;
 use uuid::Uuid;
 
@@ -487,23 +490,69 @@ impl ImageService {
         }
     }
 
-    /// Register a v2 startup memory pack prefetch for the memory image at
-    /// `image_config_path`: binds the pack's objects to the image's OSS
-    /// lowers through the same cache entries the on-demand path uses, then
-    /// hands the download to the cache scheduler. Returns `None` (no pack)
-    /// when the image has no bindable OSS lowers or the cache backend is
-    /// missing. The prefetch is best-effort: on-demand reads and background
-    /// downloads proceed regardless.
+    /// Register a v3 startup memory manifest prefetch for the memory image at
+    /// `image_config_path`. Remote objects are submitted to the shared cache
+    /// scheduler; local POSIX layers are read through buffered I/O to warm the
+    /// host page cache. Returns `None` when the image has no compatible
+    /// layers or required remote cache. The prefetch is best-effort: normal
+    /// on-demand reads always proceed regardless.
     pub async fn prefetch_startup_pack(
         &self,
         image_config_path: impl AsRef<Path>,
         pack: StartupPackPrefetch,
-    ) -> Result<Option<StartupPackHandle>> {
+    ) -> Result<Option<StartupPackPrefetchHandle>> {
+        let image_config = self.load_image_config(image_config_path.as_ref())?;
+        if let StartupPackSource::LocalPath(manifest_path) = &pack.source {
+            // Local memory layers are opened with buffered I/O under the
+            // normal io_uring engine. libaio selects O_DIRECT, where warming
+            // the host page cache would not accelerate the device path.
+            if self.io_engine() == super::image_file::IO_ENGINE_LIBAIO {
+                tracing::warn!(
+                    path = %manifest_path.display(),
+                    "skipping POSIX startup prefetch because the memory image uses direct I/O"
+                );
+                return Ok(None);
+            }
+            let Some(layers) = collect_local_startup_pack_layers(&image_config) else {
+                return Ok(None);
+            };
+            let task_key = local_startup_task_key(&pack.index_sha256, &layers);
+            if !local_startup_tasks().insert(task_key.clone()) {
+                return Ok(Some(StartupPackPrefetchHandle::Local));
+            }
+            let runtime = self.inner.remote_io_handle.clone();
+            runtime.spawn(async move {
+                let timeout = pack.timeout;
+                let result =
+                    tokio::time::timeout(timeout, execute_local_startup_prefetch(&pack, &layers))
+                        .await;
+                match result {
+                    Ok(Ok((ranges, bytes))) => tracing::info!(
+                        task_key = %task_key,
+                        ranges,
+                        bytes,
+                        "POSIX startup manifest prefetch done"
+                    ),
+                    Ok(Err(error)) => tracing::warn!(
+                        task_key = %task_key,
+                        %error,
+                        "POSIX startup manifest prefetch failed"
+                    ),
+                    Err(_) => tracing::warn!(
+                        task_key = %task_key,
+                        timeout_secs = timeout.as_secs(),
+                        "POSIX startup manifest prefetch timed out"
+                    ),
+                }
+                local_startup_tasks().remove(&task_key);
+            });
+            return Ok(Some(StartupPackPrefetchHandle::Local));
+        }
+
         let remote_runtime = self.remote_runtime().await?;
         let Some(cache) = remote_runtime.file_cache.as_ref() else {
             return Ok(None);
         };
-        let image_config = self.load_image_config(image_config_path.as_ref())?;
         let Some(refs) = collect_startup_pack_layers(&image_config) else {
             return Ok(None);
         };
@@ -521,8 +570,11 @@ impl ImageService {
         // The pack object itself bypasses the file cache: it is consumed
         // exactly once, and only its layer blocks belong in the cache. The
         // size hint avoids a stat probe.
+        let StartupPackSource::RemoteUrl(url) = &pack.source else {
+            unreachable!("local startup packs returned above")
+        };
         let pack_source = self
-            .open_backend_source_with_size(&pack.url, Some(pack.pack_size))
+            .open_backend_source_with_size(url, Some(pack.pack_size))
             .await?;
         let handle = cache.submit_startup_pack(StartupPackSubmission {
             task_key: format!("startup-pack:{}", pack.index_sha256),
@@ -533,7 +585,7 @@ impl ImageService {
             layers,
             timeout: pack.timeout,
         })?;
-        Ok(Some(handle))
+        Ok(Some(StartupPackPrefetchHandle::Remote(handle)))
     }
 
     async fn open_cached_blob(
@@ -676,13 +728,219 @@ impl ImageService {
 
 /// Parameters for one startup pack prefetch (see
 /// [`ImageService::prefetch_startup_pack`]).
+pub enum StartupPackSource {
+    RemoteUrl(String),
+    LocalPath(PathBuf),
+}
+
 pub struct StartupPackPrefetch {
-    pub url: String,
+    pub source: StartupPackSource,
     pub pack_size: u64,
     pub index_sha256: String,
     pub mem_virtual_size: u64,
-    /// Hard bound on queueing plus downloading.
+    /// Hard bound on queueing plus remote downloading or local buffered reads.
     pub timeout: std::time::Duration,
+}
+
+pub enum StartupPackPrefetchHandle {
+    Remote(StartupPackHandle),
+    /// Local tasks are detached onto the daemon-owned runtime and deduplicated
+    /// by manifest digest, so no keep-alive handle is required.
+    Local,
+}
+
+fn local_startup_tasks() -> &'static DashSet<String> {
+    static TASKS: OnceLock<DashSet<String>> = OnceLock::new();
+    TASKS.get_or_init(DashSet::new)
+}
+
+fn local_startup_task_key(
+    manifest_sha256: &str,
+    layers: &[crate::pack_planner::FinalLayerSource],
+) -> String {
+    use sha2::Digest as _;
+
+    let mut digest = sha2::Sha256::new();
+    digest.update(manifest_sha256.as_bytes());
+    for layer in layers {
+        digest.update([0]);
+        digest.update(layer.digest.as_bytes());
+        digest.update(layer.size.to_le_bytes());
+    }
+    format!("startup-pack:{:x}", digest.finalize())
+}
+
+fn local_startup_read_slots() -> &'static Arc<tokio::sync::Semaphore> {
+    static SLOTS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    SLOTS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(32)))
+}
+
+fn collect_local_startup_pack_layers(
+    image_config: &ImageConfig,
+) -> Option<Vec<crate::pack_planner::FinalLayerSource>> {
+    if image_config.lowers.is_empty() {
+        return None;
+    }
+    image_config
+        .lowers
+        .iter()
+        .map(|lower| {
+            if lower.file.is_empty() || lower.digest.is_empty() || lower.size == 0 {
+                return None;
+            }
+            Some(crate::pack_planner::FinalLayerSource {
+                digest: lower.digest.clone(),
+                size: lower.size,
+                source: crate::pack_planner::FinalLayerBytes::LocalPath(PathBuf::from(&lower.file)),
+            })
+        })
+        .collect()
+}
+
+async fn execute_local_startup_prefetch(
+    pack: &StartupPackPrefetch,
+    layers: &[crate::pack_planner::FinalLayerSource],
+) -> Result<(usize, u64)> {
+    use sha2::Digest as _;
+
+    let StartupPackSource::LocalPath(manifest_path) = &pack.source else {
+        bail!("local startup prefetch requires a local manifest path");
+    };
+    let manifest_bytes = tokio::fs::read(manifest_path)
+        .await
+        .with_context(|| format!("read startup manifest {}", manifest_path.display()))?;
+    anyhow::ensure!(
+        manifest_bytes.len() as u64 == pack.pack_size,
+        "startup manifest size mismatch: expected {}, got {}",
+        pack.pack_size,
+        manifest_bytes.len()
+    );
+    let digest = sha2::Sha256::digest(&manifest_bytes);
+    let digest = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    anyhow::ensure!(
+        digest == pack.index_sha256,
+        "startup manifest sha256 mismatch"
+    );
+    let manifest = crate::startup_manifest::decode_manifest(&manifest_bytes)
+        .context("decode startup manifest")?;
+    anyhow::ensure!(
+        manifest.mem_virtual_size == pack.mem_virtual_size,
+        "startup manifest memory size mismatch"
+    );
+
+    let mut spans = Vec::with_capacity(manifest.prefix_pages.len() + manifest.ranges.len());
+    for &offset in &manifest.prefix_pages {
+        spans.push((offset, crate::pack_planner::PLAN_PAGE_BYTES));
+    }
+    spans.extend_from_slice(&manifest.ranges);
+    let plan =
+        crate::pack_planner::plan_ranges(&spans, manifest.mem_virtual_size, layers, u64::MAX)
+            .await
+            .context("plan POSIX startup manifest ranges")?;
+    let work = Arc::new(merge_local_prefetch_runs(&plan));
+    let paths = layers
+        .iter()
+        .map(|layer| match &layer.source {
+            crate::pack_planner::FinalLayerBytes::LocalPath(path) => Ok(path.clone()),
+            crate::pack_planner::FinalLayerBytes::VFile(_) => {
+                bail!("POSIX startup layer is not a local path")
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let files = Arc::new(
+        paths
+            .iter()
+            .map(|path| {
+                LocalFile::open_ro(path)
+                    .map(Arc::new)
+                    .with_context(|| format!("open POSIX startup layer {}", path.display()))
+            })
+            .collect::<Result<Vec<_>>>()?,
+    );
+    let sizes = Arc::new(layers.iter().map(|layer| layer.size).collect::<Vec<_>>());
+    let cursor = Arc::new(AtomicUsize::new(0));
+    let bytes_read = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut workers = tokio::task::JoinSet::new();
+    for _ in 0..4usize.min(work.len().max(1)) {
+        let work = Arc::clone(&work);
+        let files = Arc::clone(&files);
+        let sizes = Arc::clone(&sizes);
+        let cursor = Arc::clone(&cursor);
+        let bytes_read = Arc::clone(&bytes_read);
+        workers.spawn(async move {
+            loop {
+                let index = cursor.fetch_add(1, Ordering::Relaxed);
+                let Some(&(layer, start_block, len_blocks)) = work.get(index) else {
+                    return Ok::<(), anyhow::Error>(());
+                };
+                let _slot = local_startup_read_slots()
+                    .acquire()
+                    .await
+                    .context("POSIX startup read semaphore closed")?;
+                let offset = start_block
+                    .checked_mul(crate::pack_planner::OBJECT_BLOCK_BYTES)
+                    .context("POSIX startup range offset overflow")?;
+                let len = sizes[layer]
+                    .saturating_sub(offset)
+                    .min(u64::from(len_blocks) * crate::pack_planner::OBJECT_BLOCK_BYTES);
+                if len == 0 {
+                    continue;
+                }
+                // `LocalFile::read_at` moves its owned allocation onto the
+                // blocking pool. This keeps slow/shared POSIX storage from
+                // pinning one of the daemon's async runtime workers.
+                let expected = usize::try_from(len)?;
+                let data = files[layer].read_at(offset, expected).await?;
+                anyhow::ensure!(data.len() == expected, "short POSIX startup layer read");
+                bytes_read.fetch_add(data.len() as u64, Ordering::Relaxed);
+            }
+        });
+    }
+    while let Some(result) = workers.join_next().await {
+        result.context("POSIX startup prefetch worker join")??;
+    }
+    Ok((work.len(), bytes_read.load(Ordering::Relaxed)))
+}
+
+fn merge_local_prefetch_runs(plan: &crate::pack_planner::PackPlan) -> Vec<(usize, u64, u32)> {
+    // Four MiB keeps each worker's read allocation bounded while still
+    // coalescing the small random reads that dominate cold POSIX resume.
+    const RUN_BLOCKS: u32 = 16;
+    let mut items = plan
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(rank, block)| {
+            (
+                plan.objects[block.object as usize].layer,
+                u64::from(block.block_id),
+                1u32,
+                rank,
+            )
+        })
+        .collect::<Vec<_>>();
+    items.sort_unstable_by_key(|(layer, block, _, _)| (*layer, *block));
+    let mut runs: Vec<(usize, u64, u32, usize)> = Vec::new();
+    for (layer, block, len, rank) in items {
+        match runs.last_mut() {
+            Some((last_layer, first, count, first_rank))
+                if *last_layer == layer
+                    && *first + u64::from(*count) == block
+                    && *count + len <= RUN_BLOCKS =>
+            {
+                *count += len;
+                *first_rank = (*first_rank).min(rank);
+            }
+            _ => runs.push((layer, block, len, rank)),
+        }
+    }
+    runs.sort_unstable_by_key(|(_, _, _, rank)| *rank);
+    runs.into_iter()
+        .map(|(layer, block, len, _)| (layer, block, len))
+        .collect()
 }
 
 /// Collect the OSS lowers of a memory image config as `(url, digest, size)`
@@ -764,6 +1022,35 @@ mod tests {
         }
     }
 
+    async fn make_local_startup_layer(
+        dir: &TempDir,
+        name: &str,
+        pages: &[(u32, u8)],
+    ) -> crate::pack_planner::FinalLayerSource {
+        use crate::lsmt::file::{CommitArgs, LSMTFile};
+
+        let data = Arc::new(LocalFile::new(dir.path().join(format!("{name}.data"))).unwrap());
+        let index = Arc::new(LocalFile::new(dir.path().join(format!("{name}.index"))).unwrap());
+        let lsmt = LSMTFile::create(data, Some(index), 1 << 30, false)
+            .await
+            .unwrap();
+        for (page, fill) in pages {
+            lsmt.write_at(u64::from(*page) * 4096, &vec![*fill; 4096])
+                .await
+                .unwrap();
+        }
+        let path = dir.path().join(name);
+        let destination: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(&path).unwrap());
+        lsmt.commit_with_args(CommitArgs::new(destination.clone()))
+            .await
+            .unwrap();
+        crate::pack_planner::FinalLayerSource {
+            digest: format!("sha256:{name}"),
+            size: destination.size().await.unwrap(),
+            source: crate::pack_planner::FinalLayerBytes::LocalPath(path),
+        }
+    }
+
     #[test]
     fn startup_pack_layers_builds_urls_like_image_open() {
         let config = ImageConfig {
@@ -834,6 +1121,74 @@ mod tests {
             ..Default::default()
         };
         assert!(collect_startup_pack_layers(&config).is_none());
+    }
+
+    #[test]
+    fn local_startup_pack_layers_require_complete_local_descriptors() {
+        let config = ImageConfig {
+            lowers: vec![crate::config::LayerConfig {
+                file: "/layers/memory.commit".to_string(),
+                digest: "sha256:aa".to_string(),
+                size: 4096,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let layers = collect_local_startup_pack_layers(&config).expect("local layer binds");
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].digest, "sha256:aa");
+        assert!(matches!(
+            &layers[0].source,
+            crate::pack_planner::FinalLayerBytes::LocalPath(path)
+                if path == Path::new("/layers/memory.commit")
+        ));
+
+        let incomplete = ImageConfig {
+            lowers: vec![crate::config::LayerConfig {
+                file: "/layers/memory.commit".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(collect_local_startup_pack_layers(&incomplete).is_none());
+        assert!(collect_local_startup_pack_layers(&ImageConfig::default()).is_none());
+    }
+
+    #[test]
+    fn local_startup_ranges_merge_physically_but_keep_first_need_priority() {
+        let plan = crate::pack_planner::PackPlan {
+            objects: vec![
+                crate::pack_planner::PlannedObject {
+                    digest: "sha256:a".to_string(),
+                    size: 1 << 20,
+                    layer: 0,
+                },
+                crate::pack_planner::PlannedObject {
+                    digest: "sha256:b".to_string(),
+                    size: 1 << 20,
+                    layer: 1,
+                },
+            ],
+            blocks: vec![
+                crate::pack_planner::PlannedBlock {
+                    object: 1,
+                    block_id: 2,
+                    metadata: false,
+                },
+                crate::pack_planner::PlannedBlock {
+                    object: 0,
+                    block_id: 7,
+                    metadata: false,
+                },
+                crate::pack_planner::PlannedBlock {
+                    object: 0,
+                    block_id: 8,
+                    metadata: false,
+                },
+            ],
+            stats: Default::default(),
+        };
+        assert_eq!(merge_local_prefetch_runs(&plan), vec![(1, 2, 1), (0, 7, 2)]);
     }
 
     async fn spawn_server(app: Router) -> (String, tokio::task::JoinHandle<()>) {
@@ -1221,6 +1576,39 @@ mod tests {
             service.inner.remote_io_handle.id(),
             tokio::runtime::Handle::current().id()
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_startup_prefetch_reads_planned_posix_ranges() {
+        let dir = TempDir::new().expect("tempdir");
+        let pages = (0..200u32)
+            .map(|page| (page, page as u8))
+            .collect::<Vec<_>>();
+        let layer = make_local_startup_layer(&dir, "memory.commit", &pages).await;
+        let manifest = crate::startup_manifest::StartupManifest {
+            mem_virtual_size: 1 << 30,
+            prefix_pages: vec![0, 99 * 4096],
+            ranges: vec![(150 * 4096, 4096)],
+        };
+        let manifest_bytes = crate::startup_manifest::encode_manifest(&manifest).unwrap();
+        let manifest_path = dir.path().join("memory-startup.pack");
+        std::fs::write(&manifest_path, &manifest_bytes).unwrap();
+        let digest = {
+            use sha2::Digest as _;
+            format!("{:x}", sha2::Sha256::digest(&manifest_bytes))
+        };
+        let pack = StartupPackPrefetch {
+            source: StartupPackSource::LocalPath(manifest_path),
+            pack_size: manifest_bytes.len() as u64,
+            index_sha256: digest,
+            mem_virtual_size: 1 << 30,
+            timeout: Duration::from_secs(5),
+        };
+        let (ranges, bytes) = execute_local_startup_prefetch(&pack, &[layer])
+            .await
+            .expect("prefetch local ranges");
+        assert!(ranges > 0);
+        assert!(bytes > 0);
     }
 
     #[tokio::test]

@@ -244,13 +244,16 @@ algorithm = "lz4"
 # parallel without changing the output layout.
 workers = 1
 
-# OSS-backend only: record the guest's startup memory pages once per snapshot
-# at publish time (a short local re-resume on the capture node, ~10s budget),
-# upload a tiny v3 page manifest, and prefetch the listed positions
-# concurrently on cold resume. Pages not yet prefetched fall back to the
-# normal on-demand path immediately. `consume_enabled` only gates resume-side
-# consumption so A/B runs can compare the same snapshot with/without it;
-# `consume_timeout_secs` bounds a manifest's queueing plus download time.
+# Record the guest's startup memory pages once per snapshot at publish time (a
+# short local re-resume on the capture node, ~10s budget), store a tiny v3 page
+# manifest, and prefetch the listed positions concurrently on cold resume. OSS
+# fills the remote-object cache; POSIX warms local/shared backing files in the
+# host page cache. Pages not yet prefetched fall back to the normal on-demand
+# path immediately. `consume_enabled` only gates resume-side consumption so
+# A/B runs can compare the same snapshot with/without it;
+# `consume_timeout_secs` bounds a manifest's queueing plus prefetch time.
+# Set both `enabled` and `consume_enabled` to true for end-to-end recording
+# and resume-time prefetch. Both default to false when this table is omitted.
 # [snapshot.memory_startup_pack]
 # enabled = false
 # record_min_window_ms = 200

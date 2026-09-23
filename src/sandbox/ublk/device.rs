@@ -428,11 +428,19 @@ impl UblkDeviceManager {
             .consume_timeout_secs;
         let result = async {
             let client = self.require_client()?;
+            let source = match &pack.location {
+                crate::snapshot::StartupPackLocation::RemoteUrl(url) => {
+                    uvm_ublk_daemon::protocol::StartupPackSource::RemoteUrl(url.clone())
+                }
+                crate::snapshot::StartupPackLocation::LocalPath(path) => {
+                    uvm_ublk_daemon::protocol::StartupPackSource::LocalPath(path.clone())
+                }
+            };
             client
                 .prefetch_startup_pack(
                     image_config,
                     global_config,
-                    &pack.url,
+                    source,
                     pack.pack_size,
                     &pack.index_sha256,
                     pack.mem_virtual_size,

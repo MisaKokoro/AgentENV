@@ -25,7 +25,7 @@ use uvm_ublk::{
 
 use crate::protocol::{
     recv_message, send_message, AccessMode, DaemonRequest, DaemonResponse, PackRecordingState,
-    ResizeToolSpec,
+    ResizeToolSpec, StartupPackSource,
 };
 use crate::runtime;
 
@@ -630,7 +630,7 @@ async fn handle_connection(
         DaemonRequest::PrefetchStartupPack {
             image_config,
             global_config,
-            url,
+            source,
             pack_size,
             index_sha256,
             mem_virtual_size,
@@ -642,7 +642,14 @@ async fn handle_connection(
                 image_config,
                 global_config,
                 overlaybd::image_service::StartupPackPrefetch {
-                    url,
+                    source: match source {
+                        StartupPackSource::RemoteUrl(url) => {
+                            overlaybd::image_service::StartupPackSource::RemoteUrl(url)
+                        }
+                        StartupPackSource::LocalPath(path) => {
+                            overlaybd::image_service::StartupPackSource::LocalPath(path)
+                        }
+                    },
                     pack_size,
                     index_sha256,
                     mem_virtual_size,
@@ -1088,7 +1095,7 @@ async fn handle_prefetch_startup_pack(
         .prefetch_startup_pack(&image_config, pack)
         .await
     {
-        Ok(Some(handle)) => {
+        Ok(Some(overlaybd::image_service::StartupPackPrefetchHandle::Remote(handle))) => {
             use overlaybd::backend::cache::StartupPackPhase;
             let mut handles = startup_pack_handles.lock().await;
             handles.retain(|existing| {
@@ -1101,6 +1108,12 @@ async fn handle_prefetch_startup_pack(
             tracing::info!(
                 image_config = %image_config.display(),
                 "startup pack prefetch registered"
+            );
+        }
+        Ok(Some(overlaybd::image_service::StartupPackPrefetchHandle::Local)) => {
+            tracing::info!(
+                image_config = %image_config.display(),
+                "POSIX startup pack prefetch registered"
             );
         }
         Ok(None) => {

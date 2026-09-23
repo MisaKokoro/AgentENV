@@ -11,6 +11,13 @@ use tokio::net::UnixStream;
 /// Maximum message size (16 MiB). Protects against corrupt length prefixes.
 const MAX_MESSAGE_SIZE: u32 = 16 * 1024 * 1024;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartupPackSource {
+    RemoteUrl(String),
+    LocalPath(PathBuf),
+}
+
 // ── Request / Response ──────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,15 +85,15 @@ pub enum DaemonRequest {
     AbortPackRecording {
         dev_id: u32,
     },
-    /// Best-effort: prefetch a v3 startup manifest for the memory image
-    /// at `image_config`, binding the manifest's layers to the image's OSS
-    /// lowers inside the cache of the `ImageService` for `global_config`.
+    /// Best-effort: prefetch a v3 startup manifest for the memory image at
+    /// `image_config`. Remote manifests refill the object cache; local
+    /// manifests warm POSIX-backed layers in the host page cache.
     /// Registration is deduplicated by pack identity; the daemon reports
     /// failures in its log and always answers `Ok`.
     PrefetchStartupPack {
         image_config: PathBuf,
         global_config: PathBuf,
-        url: String,
+        source: StartupPackSource,
         pack_size: u64,
         index_sha256: String,
         mem_virtual_size: u64,

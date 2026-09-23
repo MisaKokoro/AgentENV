@@ -130,11 +130,10 @@ impl SnapshotManager {
         let manifest = captured_snapshot.manifest().clone();
 
         // Spawn the startup-manifest recording up front (a no-op task when
-        // the feature is disabled): the throwaway recording VM overlaps the
-        // backend's layer uploads, and a detached continuation uploads the
-        // manifest once the trace lands — publish never waits on it. The
-        // capture root guard travels with the task so the artifacts outlive
-        // the whole continuation.
+        // the feature is disabled) so the throwaway recording VM overlaps
+        // backend publication. The backend decides whether finalization is
+        // detached (OSS) or joined before publish returns (POSIX). The capture
+        // root guard travels with the task so the artifacts stay alive.
         let recording = captured_snapshot
             .downcast_artifacts_ref::<FirecrackerCaptureArtifacts>()
             .map(|artifacts| crate::snapshot::StartupRecording {

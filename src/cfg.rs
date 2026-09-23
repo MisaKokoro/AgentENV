@@ -395,11 +395,11 @@ pub enum OssAddressingStyle {
     Virtual,
 }
 
-/// Publish-time startup memory manifest (OSS backend only). Records the
-/// pages touched during a short local re-resume at capture, uploads a tiny
-/// v3 page manifest in first-touch order, and prefetches the listed
-/// positions concurrently on cold resume. Pages not yet prefetched fall back
-/// to the normal OverlayBD demand path immediately.
+/// Publish-time startup memory manifest. Records the pages touched during a
+/// short local re-resume at capture and stores a tiny v3 page manifest in
+/// first-touch order. OSS resumes refill the remote-object cache; POSIX
+/// resumes warm backing files in the host page cache. Pages not yet
+/// prefetched fall back to the normal OverlayBD demand path immediately.
 #[derive(Debug, Config, Clone)]
 pub struct SnapshotStartupPackConfig {
     #[config(default = false)]
@@ -422,13 +422,13 @@ pub struct SnapshotStartupPackConfig {
     #[config(default = 1073741824u64)]
     pub max_pack_bytes: u64,
     /// Consume startup manifests at resume time (A/B switch, independent of
-    /// recording): register the manifest's layers with the shared layer cache
-    /// and prefetch their listed blocks. Legacy v1/v2 records and missing
-    /// descriptors always fall back to plain on-demand resume.
+    /// recording) through the backend-specific prefetch path. Legacy v1/v2
+    /// records and missing descriptors always fall back to plain on-demand
+    /// resume.
     #[config(default = false)]
     pub consume_enabled: bool,
-    /// Hard bound on a manifest's queueing plus download time; an overdue
-    /// manifest fails and resume proceeds on-demand.
+    /// Hard bound on a manifest's queueing plus remote-download or local-read
+    /// time; an overdue manifest fails and resume proceeds on-demand.
     #[config(default = 30u64)]
     pub consume_timeout_secs: u64,
 }

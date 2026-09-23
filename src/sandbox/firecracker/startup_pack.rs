@@ -5,7 +5,7 @@
 //! device so the daemon-side recorder sees every first-touch read while all
 //! memory layers are still node-local. The recorder emits a first-touch trace
 //! file; the publisher expands it into the v3 startup manifest (exact-order
-//! prefix plus merged ranges) and uploads just that list. The whole flow is
+//! prefix plus merged ranges) and stores just that list. The whole flow is
 //! best-effort: any failure returns `None` and the publish continues without
 //! a manifest.
 
@@ -17,16 +17,14 @@ use tracing::{debug, info, warn};
 use uvm_ublk_daemon::protocol::PackRecordingState;
 
 use super::{FirecrackerSandbox, FirecrackerSnapshotConfig};
-use crate::cfg::{ConfigManager, SnapshotRepositoryBackendKind};
+use crate::cfg::ConfigManager;
 use crate::sandbox::ublk::UblkDeviceManager;
 use crate::snapshot::MEMORY_STARTUP_TRACE_ARTIFACT;
 
-/// Recording happens only for the OSS repository backend with the feature
-/// enabled: POSIX-backed snapshots resolve memory layers to plain repository
-/// file paths, so there is no small-request object-storage chain to absorb.
+/// Recording is repository-neutral. Each backend decides how to persist and
+/// consume the resulting manifest.
 fn recording_enabled_for(config: &crate::cfg::SnapshotConfig) -> bool {
     config.memory_startup_pack.enabled
-        && config.repository_backend == SnapshotRepositoryBackendKind::Oss
 }
 
 fn recording_enabled() -> bool {
@@ -274,7 +272,7 @@ mod tests {
     }
 
     #[test]
-    fn recording_gate_requires_oss_backend_and_enabled() {
+    fn recording_gate_is_backend_neutral_and_disabled_by_default() {
         fn startup_pack_config(enabled: bool) -> crate::cfg::SnapshotStartupPackConfig {
             crate::cfg::SnapshotStartupPackConfig {
                 enabled,
@@ -295,17 +293,17 @@ mod tests {
         );
 
         let posix_enabled = crate::cfg::SnapshotConfig {
-            repository_backend: SnapshotRepositoryBackendKind::PosixFs,
+            repository_backend: crate::cfg::SnapshotRepositoryBackendKind::PosixFs,
             memory_startup_pack: startup_pack_config(true),
             ..Default::default()
         };
         assert!(
-            !recording_enabled_for(&posix_enabled),
-            "enabled=true with posix_fs backend must NOT record"
+            recording_enabled_for(&posix_enabled),
+            "enabled=true with posix_fs backend must record"
         );
 
         let oss_enabled = crate::cfg::SnapshotConfig {
-            repository_backend: SnapshotRepositoryBackendKind::Oss,
+            repository_backend: crate::cfg::SnapshotRepositoryBackendKind::Oss,
             memory_startup_pack: startup_pack_config(true),
             ..Default::default()
         };
@@ -315,7 +313,7 @@ mod tests {
         );
 
         let oss_disabled = crate::cfg::SnapshotConfig {
-            repository_backend: SnapshotRepositoryBackendKind::Oss,
+            repository_backend: crate::cfg::SnapshotRepositoryBackendKind::Oss,
             memory_startup_pack: startup_pack_config(false),
             ..Default::default()
         };

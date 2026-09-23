@@ -2,6 +2,7 @@ use overlaybd::config::load_image_config as load_overlaybd_image_config;
 use overlaybd::dense_export;
 use overlaybd::layer_metadata::read_overlaybd_layer_uuid;
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
@@ -12,7 +13,7 @@ use crate::digest::{self, FileDigest};
 use crate::sandbox::SandboxSnapshotManifest;
 use crate::snapshot::{
     CommittedAttachedDrive, ManagedLayer, OverlaybdLayerRef, RepositoryError, RepositoryResult,
-    SnapshotId, SNAPSHOT_ARTIFACT_LAYOUT,
+    SnapshotId, MEMORY_STARTUP_PACK_ARTIFACT, SNAPSHOT_ARTIFACT_LAYOUT,
 };
 
 /// Artifact store backed by files in a POSIX-compatible shared filesystem.
@@ -27,6 +28,68 @@ impl PosixFsArtifactStore {
 
     pub(crate) fn managed_layer_path(&self, digest: &str) -> PathBuf {
         PosixFsSnapshotArtifactLayout::managed_layer_path(&self.root, digest)
+    }
+
+    /// Atomically persist a startup manifest alongside the snapshot's fixed
+    /// artifacts. The descriptor is attached to the catalog only after this
+    /// rename succeeds.
+    pub(crate) fn store_startup_manifest(
+        &self,
+        snapshot_id: &SnapshotId,
+        bytes: &[u8],
+    ) -> RepositoryResult<PathBuf> {
+        let destination = self
+            .committed_layout(snapshot_id)
+            .path(MEMORY_STARTUP_PACK_ARTIFACT);
+        let parent = destination
+            .parent()
+            .ok_or_else(|| RepositoryError::Backend {
+                message: format!("resolve parent for '{}'", destination.display()),
+                source: None,
+            })?;
+        fs::create_dir_all(parent).map_err(|error| {
+            RepositoryError::backend(format!("create '{}'", parent.display()), error)
+        })?;
+        let mut temp = NamedTempFile::new_in(parent).map_err(|error| {
+            RepositoryError::backend(
+                format!(
+                    "create startup manifest temp file in '{}'",
+                    parent.display()
+                ),
+                error,
+            )
+        })?;
+        temp.write_all(bytes).map_err(|error| {
+            RepositoryError::backend(
+                format!(
+                    "write startup manifest temp file '{}'",
+                    temp.path().display()
+                ),
+                error,
+            )
+        })?;
+        temp.as_file().sync_all().map_err(|error| {
+            RepositoryError::backend(
+                format!(
+                    "sync startup manifest temp file '{}'",
+                    temp.path().display()
+                ),
+                error,
+            )
+        })?;
+        let temp_path = temp.path().to_path_buf();
+        temp.persist(&destination).map_err(|error| {
+            RepositoryError::backend(
+                format!(
+                    "persist startup manifest '{}' -> '{}'",
+                    temp_path.display(),
+                    destination.display()
+                ),
+                error.error,
+            )
+        })?;
+        sync_dir(parent)?;
+        Ok(destination)
     }
 
     fn committed_layout(&self, snapshot_id: &SnapshotId) -> PosixFsSnapshotArtifactLayout {
