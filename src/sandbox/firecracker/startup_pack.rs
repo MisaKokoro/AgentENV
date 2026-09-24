@@ -33,10 +33,10 @@ fn recording_enabled() -> bool {
     recording_enabled_for(&ConfigManager::global_config().snapshot)
 }
 
-/// Synchronously warm the block-device page cache for the exact memory ublk
-/// device Firecracker will mmap. This intentionally reads the full manifest
-/// before restore; it is an experiment to distinguish final logical-page
-/// cache effects from backing-file cache effects.
+/// Warm the block-device page cache for the exact memory ublk device
+/// Firecracker will mmap. The returned future completes after the full
+/// manifest has been read; callers may detach it to overlap prefetch with
+/// restore.
 pub(super) async fn prefetch_ublk_startup_pages(
     device_path: &Path,
     pack: &crate::snapshot::ResolvedStartupPack,
