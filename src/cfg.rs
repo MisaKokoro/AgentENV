@@ -427,8 +427,16 @@ pub struct SnapshotStartupPackConfig {
     /// resume.
     #[config(default = false)]
     pub consume_enabled: bool,
+    /// Experimental POSIX path: after acquiring the shared memory ublk
+    /// device, synchronously read every guest range in the manifest through
+    /// that device before Firecracker loads the snapshot. This replaces the
+    /// backing-file prefetch for local manifests and intentionally adds the
+    /// full read cost to resume so its cache level can be measured directly.
+    #[config(default = false)]
+    pub posix_ublk_prefetch_enabled: bool,
     /// Hard bound on a manifest's queueing plus remote-download or local-read
-    /// time; an overdue manifest fails and resume proceeds on-demand.
+    /// time for asynchronous prefetch. The experimental synchronous ublk
+    /// prefetch always reads the complete manifest and does not use this bound.
     #[config(default = 30u64)]
     pub consume_timeout_secs: u64,
 }

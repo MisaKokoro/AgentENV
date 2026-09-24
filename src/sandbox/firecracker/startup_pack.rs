@@ -21,6 +21,8 @@ use crate::cfg::ConfigManager;
 use crate::sandbox::ublk::UblkDeviceManager;
 use crate::snapshot::MEMORY_STARTUP_TRACE_ARTIFACT;
 
+const UBLK_PREFETCH_CHUNK_BYTES: usize = 4 << 20;
+
 /// Recording is repository-neutral. Each backend decides how to persist and
 /// consume the resulting manifest.
 fn recording_enabled_for(config: &crate::cfg::SnapshotConfig) -> bool {
@@ -29,6 +31,86 @@ fn recording_enabled_for(config: &crate::cfg::SnapshotConfig) -> bool {
 
 fn recording_enabled() -> bool {
     recording_enabled_for(&ConfigManager::global_config().snapshot)
+}
+
+/// Synchronously warm the block-device page cache for the exact memory ublk
+/// device Firecracker will mmap. This intentionally reads the full manifest
+/// before restore; it is an experiment to distinguish final logical-page
+/// cache effects from backing-file cache effects.
+pub(super) async fn prefetch_ublk_startup_pages(
+    device_path: &Path,
+    pack: &crate::snapshot::ResolvedStartupPack,
+) -> Result<()> {
+    let crate::snapshot::StartupPackLocation::LocalPath(manifest_path) = &pack.location else {
+        anyhow::bail!("ublk startup prefetch requires a local manifest");
+    };
+    let manifest_bytes = tokio::fs::read(manifest_path)
+        .await
+        .with_context(|| format!("read startup manifest {}", manifest_path.display()))?;
+    anyhow::ensure!(
+        manifest_bytes.len() as u64 == pack.pack_size,
+        "startup manifest size mismatch: expected {}, got {}",
+        pack.pack_size,
+        manifest_bytes.len()
+    );
+    anyhow::ensure!(
+        crate::snapshot::startup_pack::hex_sha256(&manifest_bytes) == pack.index_sha256,
+        "startup manifest sha256 mismatch"
+    );
+    let manifest = overlaybd::startup_manifest::decode_manifest(&manifest_bytes)
+        .context("decode startup manifest")?;
+    anyhow::ensure!(
+        manifest.mem_virtual_size == pack.mem_virtual_size,
+        "startup manifest memory size mismatch"
+    );
+
+    let device_path = device_path.to_path_buf();
+    let manifest_path = manifest_path.clone();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        use std::os::unix::fs::FileExt;
+
+        let device = std::fs::File::open(&device_path)
+            .with_context(|| format!("open memory ublk device {}", device_path.display()))?;
+        let mut buffer = vec![0u8; UBLK_PREFETCH_CHUNK_BYTES];
+        let mut bytes_read = 0u64;
+        let mut read_count = 0u64;
+        let spans = manifest
+            .prefix_pages
+            .into_iter()
+            .map(|offset| (offset, overlaybd::startup_pack::PACK_PAGE_BYTES))
+            .chain(manifest.ranges);
+        for (start, len) in spans {
+            let mut offset = start;
+            let end = start.checked_add(len).context("startup range overflow")?;
+            while offset < end {
+                let chunk_len =
+                    usize::try_from((end - offset).min(UBLK_PREFETCH_CHUNK_BYTES as u64))?;
+                device
+                    .read_exact_at(&mut buffer[..chunk_len], offset)
+                    .with_context(|| {
+                        format!(
+                            "prefetch memory ublk {} at offset {offset:#x}",
+                            device_path.display()
+                        )
+                    })?;
+                offset += chunk_len as u64;
+                bytes_read += chunk_len as u64;
+                read_count += 1;
+            }
+        }
+        info!(
+            device_path = %device_path.display(),
+            manifest_path = %manifest_path.display(),
+            pages = bytes_read / overlaybd::startup_pack::PACK_PAGE_BYTES,
+            bytes = bytes_read,
+            reads = read_count,
+            "memory ublk startup prefetch complete"
+        );
+        Ok(())
+    })
+    .await
+    .context("memory ublk startup prefetch task failed to join")??;
+    Ok(())
 }
 
 /// Record the first-touch trace for a just-captured snapshot.
@@ -244,6 +326,37 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn ublk_prefetch_reads_manifest_ranges_from_device() -> Result<()> {
+        let tmp = tempfile::TempDir::new()?;
+        let device_path = tmp.path().join("ublk-device");
+        let device = std::fs::File::create(&device_path)?;
+        device.set_len(3 * overlaybd::startup_pack::PACK_PAGE_BYTES)?;
+
+        let manifest = overlaybd::startup_manifest::StartupManifest {
+            mem_virtual_size: 16 * overlaybd::startup_pack::PACK_PAGE_BYTES,
+            prefix_pages: vec![0],
+            ranges: vec![(
+                overlaybd::startup_pack::PACK_PAGE_BYTES,
+                2 * overlaybd::startup_pack::PACK_PAGE_BYTES,
+            )],
+        };
+        let manifest_bytes = overlaybd::startup_manifest::encode_manifest(&manifest)?;
+        let manifest_path = tmp
+            .path()
+            .join(crate::snapshot::MEMORY_STARTUP_PACK_ARTIFACT);
+        tokio::fs::write(&manifest_path, &manifest_bytes).await?;
+        let pack = crate::snapshot::ResolvedStartupPack {
+            location: crate::snapshot::StartupPackLocation::LocalPath(manifest_path),
+            pack_size: manifest_bytes.len() as u64,
+            index_sha256: crate::snapshot::startup_pack::hex_sha256(&manifest_bytes),
+            mem_virtual_size: manifest.mem_virtual_size,
+        };
+
+        prefetch_ublk_startup_pages(&device_path, &pack).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn recording_mem_config_disables_background_download() -> Result<()> {
         let tmp = tempfile::TempDir::new()?;
         let src = tmp.path().join("mem_image.json");
@@ -282,6 +395,7 @@ mod tests {
                 record_budget_secs: 10,
                 max_pack_bytes: 1 << 30,
                 consume_enabled: false,
+                posix_ublk_prefetch_enabled: false,
                 consume_timeout_secs: 30,
             }
         }

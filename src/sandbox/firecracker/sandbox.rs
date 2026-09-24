@@ -2244,11 +2244,25 @@ impl FirecrackerSandbox {
                 .context("arm startup pack recorder")?;
             device_path
         } else {
+            let posix_ublk_pack = config.memory_startup_pack.as_ref().filter(|pack| {
+                global_config
+                    .snapshot
+                    .memory_startup_pack
+                    .posix_ublk_prefetch_enabled
+                    && matches!(
+                        &pack.location,
+                        crate::snapshot::StartupPackLocation::LocalPath(_)
+                    )
+            });
             // Register the startup manifest prefetch BEFORE opening the
             // memory image: the prefetch then refills into the same cache
             // the device opens, racing guest faults from the very first
             // metadata read. Registration itself never blocks the resume.
-            if let Some(pack) = &config.memory_startup_pack {
+            if let Some(pack) = config
+                .memory_startup_pack
+                .as_ref()
+                .filter(|_| posix_ublk_pack.is_none())
+            {
                 let startup_prefetch_registration_start = Instant::now();
                 UblkDeviceManager::global()
                     .prefetch_startup_pack(
@@ -2282,6 +2296,27 @@ impl FirecrackerSandbox {
                 "sandbox stage elapsed"
             );
             let device_path = mem_device.device_path().to_path_buf();
+
+            if let Some(pack) = posix_ublk_pack {
+                let ublk_prefetch_start = Instant::now();
+                let result =
+                    super::startup_pack::prefetch_ublk_startup_pages(&device_path, pack).await;
+                let success = result.is_ok();
+                if let Err(error) = result {
+                    warn!(
+                        operation,
+                        %error,
+                        "memory ublk startup prefetch failed; continuing on demand"
+                    );
+                }
+                info!(
+                    operation,
+                    stage = "ublk_prefetch",
+                    elapsed_ms = ublk_prefetch_start.elapsed().as_millis() as u64,
+                    success,
+                    "sandbox stage elapsed"
+                );
+            }
 
             self.mem_snapshot_image_config_path =
                 Some(config.mem_overlaybd_config.image_config_path.clone());
