@@ -69,16 +69,18 @@ pub(super) async fn prefetch_ublk_startup_pages(
         "startup manifest memory size mismatch"
     );
 
-    let spans = Arc::new(limit_prefetch_spans(manifest, max_prefetch_bytes));
-    let worker_count = workers.min(spans.len());
+    let spans = limit_prefetch_spans(manifest, max_prefetch_bytes);
+    let range_count = spans.len();
+    let chunks = Arc::new(split_prefetch_chunks(spans)?);
+    let worker_count = workers.min(chunks.len());
     let cursor = Arc::new(AtomicUsize::new(0));
     let mut tasks = Vec::with_capacity(worker_count);
     for _ in 0..worker_count {
         let device_path = device_path.to_path_buf();
-        let spans = Arc::clone(&spans);
+        let chunks = Arc::clone(&chunks);
         let cursor = Arc::clone(&cursor);
         tasks.push(tokio::task::spawn_blocking(move || {
-            prefetch_ublk_worker(&device_path, &spans, &cursor)
+            prefetch_ublk_worker(&device_path, &chunks, &cursor)
         }));
     }
 
@@ -108,7 +110,8 @@ pub(super) async fn prefetch_ublk_startup_pages(
         device_path = %device_path.display(),
         manifest_path = %manifest_path.display(),
         workers = worker_count,
-        ranges = spans.len(),
+        ranges = range_count,
+        chunks = chunks.len(),
         pages = bytes_read / overlaybd::startup_pack::PACK_PAGE_BYTES,
         bytes = bytes_read,
         reads = read_count,
@@ -144,9 +147,23 @@ fn limit_prefetch_spans(
     limited
 }
 
+fn split_prefetch_chunks(spans: Vec<(u64, u64)>) -> Result<Vec<(u64, u64)>> {
+    let mut chunks = Vec::new();
+    for (start, len) in spans {
+        let end = start.checked_add(len).context("startup range overflow")?;
+        let mut offset = start;
+        while offset < end {
+            let chunk_len = (end - offset).min(UBLK_PREFETCH_CHUNK_BYTES as u64);
+            chunks.push((offset, chunk_len));
+            offset += chunk_len;
+        }
+    }
+    Ok(chunks)
+}
+
 fn prefetch_ublk_worker(
     device_path: &Path,
-    spans: &[(u64, u64)],
+    chunks: &[(u64, u64)],
     cursor: &AtomicUsize,
 ) -> Result<(u64, u64)> {
     use std::os::unix::fs::FileExt;
@@ -166,25 +183,20 @@ fn prefetch_ublk_worker(
     let mut read_count = 0u64;
     loop {
         let index = cursor.fetch_add(1, Ordering::Relaxed);
-        let Some(&(start, len)) = spans.get(index) else {
+        let Some(&(offset, len)) = chunks.get(index) else {
             break;
         };
-        let mut offset = start;
-        let end = start.checked_add(len).context("startup range overflow")?;
-        while offset < end {
-            let chunk_len = usize::try_from((end - offset).min(UBLK_PREFETCH_CHUNK_BYTES as u64))?;
-            device
-                .read_exact_at(&mut buffer[..chunk_len], offset)
-                .with_context(|| {
-                    format!(
-                        "prefetch memory ublk {} at offset {offset:#x}",
-                        device_path.display()
-                    )
-                })?;
-            offset += chunk_len as u64;
-            bytes_read += chunk_len as u64;
-            read_count += 1;
-        }
+        let chunk_len = usize::try_from(len)?;
+        device
+            .read_exact_at(&mut buffer[..chunk_len], offset)
+            .with_context(|| {
+                format!(
+                    "prefetch memory ublk {} at offset {offset:#x}",
+                    device_path.display()
+                )
+            })?;
+        bytes_read += len;
+        read_count += 1;
     }
     Ok((bytes_read, read_count))
 }
@@ -449,6 +461,29 @@ mod tests {
             limit_prefetch_spans(manifest, 0),
             vec![(0, page), (4 * page, 3 * page), (12 * page, 2 * page)]
         );
+    }
+
+    #[test]
+    fn ublk_prefetch_splits_large_ranges_into_chunks() -> Result<()> {
+        let page = overlaybd::startup_pack::PACK_PAGE_BYTES;
+        let chunk = UBLK_PREFETCH_CHUNK_BYTES as u64;
+
+        let chunks = split_prefetch_chunks(vec![(page, 2 * chunk + page), (8 * chunk, chunk)])?;
+
+        assert_eq!(
+            chunks,
+            vec![
+                (page, chunk),
+                (page + chunk, chunk),
+                (page + 2 * chunk, page),
+                (8 * chunk, chunk),
+            ]
+        );
+        assert_eq!(
+            chunks.iter().map(|(_, len)| len).sum::<u64>(),
+            3 * chunk + page
+        );
+        Ok(())
     }
 
     #[tokio::test]
