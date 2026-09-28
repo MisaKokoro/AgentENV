@@ -62,9 +62,9 @@ pub enum DaemonRequest {
     NotifySandboxReady {
         device_key: String,
     },
-    /// Arm a startup-pack first-touch recorder on an existing device and
-    /// start the recording window state machine. When the window ends the
-    /// daemon writes the recorded first-touch trace into `output`
+    /// Arm a startup-pack first-touch recorder on an existing device. When
+    /// the selected completion condition is reached, the daemon writes the
+    /// recorded first-touch trace into `output`
     /// (atomically, via a `.tmp` sibling) and reports the result through
     /// `PackRecordingStatus`.
     StartPackRecording {
@@ -75,9 +75,16 @@ pub enum DaemonRequest {
         min_window_ms: u64,
         quiet_ms: u64,
         max_window_ms: u64,
+        /// Wait for `FinishPackRecording` instead of the window state machine.
+        #[serde(default)]
+        finish_on_request: bool,
     },
     /// Poll the state of the pack recording running on `dev_id`.
     PackRecordingStatus {
+        dev_id: u32,
+    },
+    /// Stop observing new reads and persist the pages recorded so far.
+    FinishPackRecording {
         dev_id: u32,
     },
     /// Abort a pack recording (idempotent): detach the recorder, stop the
@@ -280,6 +287,54 @@ mod tests {
             }
             _ => panic!("unexpected variant"),
         }
+    }
+
+    #[test]
+    fn startup_pack_finish_mode_round_trip_and_defaults() {
+        let req = DaemonRequest::StartPackRecording {
+            dev_id: 9,
+            output: PathBuf::from("/tmp/memory-startup.trace"),
+            max_pages: 1024,
+            min_window_ms: 200,
+            quiet_ms: 300,
+            max_window_ms: 2000,
+            finish_on_request: true,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let decoded: DaemonRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            decoded,
+            DaemonRequest::StartPackRecording {
+                finish_on_request: true,
+                ..
+            }
+        ));
+
+        let legacy = r#"{
+            "kind":"start_pack_recording",
+            "dev_id":9,
+            "output":"/tmp/memory-startup.trace",
+            "max_pages":1024,
+            "min_window_ms":200,
+            "quiet_ms":300,
+            "max_window_ms":2000
+        }"#;
+        let decoded: DaemonRequest = serde_json::from_str(legacy).unwrap();
+        assert!(matches!(
+            decoded,
+            DaemonRequest::StartPackRecording {
+                finish_on_request: false,
+                ..
+            }
+        ));
+
+        let finish = DaemonRequest::FinishPackRecording { dev_id: 9 };
+        let json = serde_json::to_string(&finish).unwrap();
+        let decoded: DaemonRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            decoded,
+            DaemonRequest::FinishPackRecording { dev_id: 9 }
+        ));
     }
 
     #[test]

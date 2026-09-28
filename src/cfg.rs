@@ -421,6 +421,10 @@ pub struct SnapshotStartupPackConfig {
     /// Per-pack page-data cap (hard truncation in the pack writer).
     #[config(default = 1073741824u64)]
     pub max_pack_bytes: u64,
+    /// POSIX-only experiment: finish and persist the recording when the
+    /// recording VM reaches envd-ready instead of using the quiet window.
+    #[config(default = false)]
+    pub posix_record_until_envd_ready: bool,
     /// Consume startup manifests at resume time (A/B switch, independent of
     /// recording) through the backend-specific prefetch path. Legacy v1/v2
     /// records and missing descriptors always fall back to plain on-demand
@@ -1517,6 +1521,13 @@ mod tests {
                 .memory_startup_pack
                 .max_prefetch_bytes,
             0
+        );
+        assert!(
+            !config
+                .config()
+                .snapshot
+                .memory_startup_pack
+                .posix_record_until_envd_ready
         );
         Ok(())
     }

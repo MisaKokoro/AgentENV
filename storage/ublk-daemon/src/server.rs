@@ -48,6 +48,8 @@ struct PackRecordingHandle {
     /// Held by the window task while packaging runs; abort cleanup acquires
     /// it so file removal never races an in-flight finalize rename.
     finalize_gate: Arc<tokio::sync::Mutex<()>>,
+    /// Wakes recordings whose endpoint is controlled by the client.
+    finish: Arc<Notify>,
 }
 
 // ── Pooled device wrapper ───────────────────────────────────────────────────
@@ -606,6 +608,7 @@ async fn handle_connection(
             min_window_ms,
             quiet_ms,
             max_window_ms,
+            finish_on_request,
         } => {
             handle_start_pack_recording(
                 &devices,
@@ -617,12 +620,16 @@ async fn handle_connection(
                     min_window: Duration::from_millis(min_window_ms),
                     quiet: Duration::from_millis(quiet_ms),
                     max_window: Duration::from_millis(max_window_ms),
+                    finish_on_request,
                 },
             )
             .await
         }
         DaemonRequest::PackRecordingStatus { dev_id } => {
             handle_pack_recording_status(&pack_recordings, dev_id)
+        }
+        DaemonRequest::FinishPackRecording { dev_id } => {
+            handle_finish_pack_recording(&pack_recordings, dev_id)
         }
         DaemonRequest::AbortPackRecording { dev_id } => {
             handle_abort_pack_recording(&devices, &pack_recordings, dev_id).await
@@ -958,6 +965,7 @@ struct PackRecordingParams {
     min_window: Duration,
     quiet: Duration,
     max_window: Duration,
+    finish_on_request: bool,
 }
 
 async fn handle_start_pack_recording(
@@ -1036,6 +1044,7 @@ async fn handle_start_pack_recording(
     let state = Arc::new(std::sync::Mutex::new(PackRecordingState::Recording));
     let cancelled = Arc::new(AtomicBool::new(false));
     let finalize_gate = Arc::new(tokio::sync::Mutex::new(()));
+    let finish = Arc::new(Notify::new());
     let task = tokio::spawn(pack_recording_window(
         Arc::clone(&recorder),
         target,
@@ -1043,6 +1052,7 @@ async fn handle_start_pack_recording(
         Arc::clone(&state),
         Arc::clone(&cancelled),
         Arc::clone(&finalize_gate),
+        Arc::clone(&finish),
     ));
     pack_recordings.insert(
         dev_id,
@@ -1052,6 +1062,7 @@ async fn handle_start_pack_recording(
             task,
             cancelled,
             finalize_gate,
+            finish,
         }),
     );
     Ok(DaemonResponse::Ok)
@@ -1072,6 +1083,25 @@ fn handle_pack_recording_status(
         .expect("recording state poisoned")
         .clone();
     Ok(DaemonResponse::PackRecording { state })
+}
+
+fn handle_finish_pack_recording(
+    pack_recordings: &DashMap<u32, Arc<PackRecordingHandle>>,
+    dev_id: u32,
+) -> Result<DaemonResponse> {
+    let Some(handle) = pack_recordings.get(&dev_id) else {
+        return Ok(DaemonResponse::InvalidRequest {
+            message: format!("no pack recording on device {dev_id}"),
+        });
+    };
+    let recording = matches!(
+        *handle.state.lock().expect("recording state poisoned"),
+        PackRecordingState::Recording
+    );
+    if recording {
+        handle.finish.notify_one();
+    }
+    Ok(DaemonResponse::Ok)
 }
 
 /// Best-effort startup pack prefetch registration. Every failure mode
@@ -1170,15 +1200,29 @@ async fn pack_recording_window(
     state: Arc<std::sync::Mutex<PackRecordingState>>,
     cancelled: Arc<AtomicBool>,
     finalize_gate: Arc<tokio::sync::Mutex<()>>,
+    finish: Arc<Notify>,
 ) {
     use uvm_ublk::RecordingVerdict;
 
-    let mut ticker = tokio::time::interval(PACK_RECORDING_TICK);
-    let verdict = loop {
-        ticker.tick().await;
-        let verdict = recorder.verdict(params.min_window, params.quiet, params.max_window);
-        if verdict != RecordingVerdict::Continue {
-            break verdict;
+    let verdict = if params.finish_on_request {
+        finish.notified().await;
+        RecordingVerdict::Finish
+    } else {
+        let mut ticker = tokio::time::interval(PACK_RECORDING_TICK);
+        loop {
+            tokio::select! {
+                _ = finish.notified() => break RecordingVerdict::Finish,
+                _ = ticker.tick() => {
+                    let verdict = recorder.verdict(
+                        params.min_window,
+                        params.quiet,
+                        params.max_window,
+                    );
+                    if verdict != RecordingVerdict::Continue {
+                        break verdict;
+                    }
+                }
+            }
         }
     };
 

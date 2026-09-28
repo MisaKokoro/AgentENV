@@ -730,6 +730,7 @@ mod client_tests {
                 DaemonRequest::PackRecordingStatus { .. } => DaemonResponse::PackRecording {
                     state: PackRecordingState::Recording,
                 },
+                DaemonRequest::FinishPackRecording { .. } => DaemonResponse::Ok,
                 DaemonRequest::AbortPackRecording { .. } => DaemonResponse::Ok,
                 DaemonRequest::PrefetchStartupPack { .. } => DaemonResponse::Ok,
             }
@@ -747,8 +748,9 @@ mod client_tests {
             .restack_snapshot(40, Path::new("/snap/output"))
             .await
             .unwrap();
+        client.finish_pack_recording(50).await.unwrap();
         let requests = captured.lock().unwrap();
-        assert_eq!(requests.len(), 3);
+        assert_eq!(requests.len(), 4);
 
         assert!(requests[0].contains("CreateOverlaybd"));
         assert!(requests[0].contains("img.json"));
@@ -761,6 +763,9 @@ mod client_tests {
         assert!(requests[2].contains("RestackSnapshot"));
         assert!(requests[2].contains("40"));
         assert!(requests[2].contains("output"));
+
+        assert!(requests[3].contains("FinishPackRecording"));
+        assert!(requests[3].contains("50"));
     }
 }
 

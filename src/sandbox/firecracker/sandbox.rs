@@ -2220,6 +2220,8 @@ impl FirecrackerSandbox {
             // Arm the first-touch recorder BEFORE the snapshot loads so FC's
             // load-time reads and the guest's first faults are all recorded.
             let pack_config = &global_config.snapshot.memory_startup_pack;
+            let finish_on_request =
+                super::startup_pack::record_until_envd_ready_for(&global_config.snapshot);
             let output = config
                 .vm_state_path
                 .parent()
@@ -2238,6 +2240,7 @@ impl FirecrackerSandbox {
                         min_window_ms: pack_config.record_min_window_ms,
                         quiet_ms: pack_config.record_quiet_ms,
                         max_window_ms: pack_config.record_max_window_ms,
+                        finish_on_request,
                     },
                 )
                 .await

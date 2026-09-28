@@ -32,6 +32,7 @@ pub(crate) struct PackRecordingWindow {
     pub min_window_ms: u64,
     pub quiet_ms: u64,
     pub max_window_ms: u64,
+    pub finish_on_request: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -397,6 +398,7 @@ impl UblkDeviceManager {
                 window.min_window_ms,
                 window.quiet_ms,
                 window.max_window_ms,
+                window.finish_on_request,
             )
             .await
     }
@@ -405,6 +407,12 @@ impl UblkDeviceManager {
     pub(crate) async fn pack_recording_status(&self, dev_id: u32) -> Result<PackRecordingState> {
         let client = self.require_client()?;
         client.pack_recording_status(dev_id).await
+    }
+
+    /// Finish the pack recording and preserve the pages observed so far.
+    pub(crate) async fn finish_pack_recording(&self, dev_id: u32) -> Result<()> {
+        let client = self.require_client()?;
+        client.finish_pack_recording(dev_id).await
     }
 
     /// Abort the pack recording on `dev_id` (idempotent).

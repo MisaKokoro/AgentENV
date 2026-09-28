@@ -32,6 +32,11 @@ fn recording_enabled_for(config: &crate::cfg::SnapshotConfig) -> bool {
     config.memory_startup_pack.enabled
 }
 
+pub(super) fn record_until_envd_ready_for(config: &crate::cfg::SnapshotConfig) -> bool {
+    config.repository_backend == crate::cfg::SnapshotRepositoryBackendKind::PosixFs
+        && config.memory_startup_pack.posix_record_until_envd_ready
+}
+
 fn recording_enabled() -> bool {
     recording_enabled_for(&ConfigManager::global_config().snapshot)
 }
@@ -218,6 +223,8 @@ pub(crate) async fn record_startup_pack(
         .snapshot
         .memory_startup_pack
         .record_budget_secs;
+    let record_until_envd_ready =
+        record_until_envd_ready_for(&ConfigManager::global_config().snapshot);
     let trace_path = snapshot_dir.join(MEMORY_STARTUP_TRACE_ARTIFACT);
 
     let recording_config = match derive_recording_mem_config(
@@ -235,7 +242,7 @@ pub(crate) async fn record_startup_pack(
     config.mem_overlaybd_config.image_config_path = recording_config.clone();
     config.pack_recording = true;
 
-    let outcome = boot_and_wait(config, &trace_path, budget_secs).await;
+    let outcome = boot_and_wait(config, &trace_path, budget_secs, record_until_envd_ready).await;
 
     if outcome.is_none() {
         cleanup_pack_files(&trace_path, &recording_config).await;
@@ -250,13 +257,14 @@ pub(crate) async fn record_startup_pack(
     Some(trace_path)
 }
 
-/// Boot the recording VM, wait (bounded) for the daemon-side window, then
+/// Boot the recording VM, wait (bounded) for the configured endpoint, then
 /// clean up (unbounded). The VM handle and device id live outside the
 /// timeout scope so the cleanup path always runs to completion.
 async fn boot_and_wait(
     config: FirecrackerSnapshotConfig,
     trace_path: &Path,
     budget_secs: u64,
+    record_until_envd_ready: bool,
 ) -> Option<PathBuf> {
     let phase_t0 = std::time::Instant::now();
     let mut recording_vm = match FirecrackerSandbox::from_snapshot_config(&config) {
@@ -284,10 +292,27 @@ async fn boot_and_wait(
 
     info!(
         elapsed_ms = phase_t0.elapsed().as_millis() as u64,
-        "startup pack: recording VM started; status wait begins"
+        record_until_envd_ready, "startup pack: recording VM started; completion wait begins"
     );
     // Only this wait is bounded by the budget.
     let wait = async {
+        if record_until_envd_ready {
+            if let Err(error) = recording_vm.wait_for_ready().await {
+                warn!(%error, "startup pack: recording VM envd-ready wait failed");
+                return None;
+            }
+            info!(
+                elapsed_ms = phase_t0.elapsed().as_millis() as u64,
+                "startup pack: recording VM reached envd-ready; finalizing trace"
+            );
+            if let Err(error) = UblkDeviceManager::global()
+                .finish_pack_recording(dev_id)
+                .await
+            {
+                warn!(%error, "startup pack: finish recording failed");
+                return None;
+            }
+        }
         loop {
             match UblkDeviceManager::global()
                 .pack_recording_status(dev_id)
@@ -322,7 +347,7 @@ async fn boot_and_wait(
     };
     info!(
         elapsed_ms = phase_t0.elapsed().as_millis() as u64,
-        "startup pack: status wait ended"
+        "startup pack: completion wait ended"
     );
 
     // Cleanup is never truncated by the budget on the normal paths — except
@@ -524,6 +549,7 @@ mod tests {
                 record_max_window_ms: 2000,
                 record_budget_secs: 10,
                 max_pack_bytes: 1 << 30,
+                posix_record_until_envd_ready: false,
                 consume_enabled: false,
                 posix_ublk_prefetch_enabled: false,
                 posix_ublk_prefetch_workers: 4,
@@ -547,6 +573,13 @@ mod tests {
             recording_enabled_for(&posix_enabled),
             "enabled=true with posix_fs backend must record"
         );
+        assert!(!record_until_envd_ready_for(&posix_enabled));
+
+        let mut posix_envd_ready = posix_enabled.clone();
+        posix_envd_ready
+            .memory_startup_pack
+            .posix_record_until_envd_ready = true;
+        assert!(record_until_envd_ready_for(&posix_envd_ready));
 
         let oss_enabled = crate::cfg::SnapshotConfig {
             repository_backend: crate::cfg::SnapshotRepositoryBackendKind::Oss,
@@ -556,6 +589,14 @@ mod tests {
         assert!(
             recording_enabled_for(&oss_enabled),
             "enabled=true with oss backend must record"
+        );
+        let mut oss_envd_ready = oss_enabled.clone();
+        oss_envd_ready
+            .memory_startup_pack
+            .posix_record_until_envd_ready = true;
+        assert!(
+            !record_until_envd_ready_for(&oss_envd_ready),
+            "the envd-ready endpoint must remain POSIX-only"
         );
 
         let oss_disabled = crate::cfg::SnapshotConfig {

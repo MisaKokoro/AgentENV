@@ -261,6 +261,9 @@ workers = 1
 # record_max_window_ms = 2000
 # record_budget_secs = 10
 # max_pack_bytes = 1073741824
+# POSIX-only experiment: finish recording when the recording VM reaches
+# envd-ready. OSS and false keep the min/quiet/max recording window.
+# posix_record_until_envd_ready = false
 # consume_enabled = false
 # Experimental POSIX-only mode: synchronously read manifest ranges from the
 # shared memory /dev/ublkbN before Firecracker restore. Reads use bounded

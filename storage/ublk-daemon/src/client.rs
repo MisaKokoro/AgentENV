@@ -403,6 +403,7 @@ impl UblkDaemonClient {
         min_window_ms: u64,
         quiet_ms: u64,
         max_window_ms: u64,
+        finish_on_request: bool,
     ) -> Result<()> {
         let request = DaemonRequest::StartPackRecording {
             dev_id,
@@ -411,6 +412,7 @@ impl UblkDaemonClient {
             min_window_ms,
             quiet_ms,
             max_window_ms,
+            finish_on_request,
         };
         match self.call(request, DEFAULT_TIMEOUT).await? {
             DaemonResponse::Ok => Ok(()),
@@ -421,6 +423,21 @@ impl UblkDaemonClient {
                 bail!("daemon: start pack recording failed: {message}")
             }
             other => bail!("daemon: unexpected response for start pack recording: {other:?}"),
+        }
+    }
+
+    /// Stop observing new reads and package the pages recorded so far.
+    pub async fn finish_pack_recording(&self, dev_id: u32) -> Result<()> {
+        let request = DaemonRequest::FinishPackRecording { dev_id };
+        match self.call(request, DEFAULT_TIMEOUT).await? {
+            DaemonResponse::Ok => Ok(()),
+            DaemonResponse::InvalidRequest { message } => {
+                bail!("daemon: finish pack recording rejected: {message}")
+            }
+            DaemonResponse::Error { message } => {
+                bail!("daemon: finish pack recording failed: {message}")
+            }
+            other => bail!("daemon: unexpected response for finish pack recording: {other:?}"),
         }
     }
 
