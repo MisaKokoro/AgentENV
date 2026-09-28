@@ -427,16 +427,20 @@ pub struct SnapshotStartupPackConfig {
     /// resume.
     #[config(default = false)]
     pub consume_enabled: bool,
-    /// Experimental POSIX path: after acquiring the shared memory ublk
-    /// device, synchronously read every guest range in the manifest through
-    /// that device before Firecracker loads the snapshot. This replaces the
-    /// backing-file prefetch for local manifests and intentionally adds the
-    /// full read cost to resume so its cache level can be measured directly.
+    /// Experimental POSIX path: synchronously read guest ranges in the
+    /// manifest through the shared memory ublk device before restore.
     #[config(default = false)]
     pub posix_ublk_prefetch_enabled: bool,
+    /// Number of blocking workers used by the POSIX memory ublk prefetch.
+    #[config(default = 4usize)]
+    pub posix_ublk_prefetch_workers: usize,
+    /// Maximum logical bytes read by the POSIX memory ublk prefetch. Zero
+    /// means unlimited; non-page-aligned values are rounded down to 4 KiB.
+    #[config(default = 0u64)]
+    pub max_prefetch_bytes: u64,
     /// Hard bound on a manifest's queueing plus remote-download or local-read
-    /// time for asynchronous prefetch. The experimental synchronous ublk
-    /// prefetch always reads the complete manifest and does not use this bound.
+    /// time for asynchronous backing-file prefetch. The experimental ublk
+    /// prefetch does not use this time bound.
     #[config(default = 30u64)]
     pub consume_timeout_secs: u64,
 }
@@ -1027,6 +1031,18 @@ impl AppConfig {
         if self.ublk.overlaybd.remote_io_workers == 0 {
             bail!("invalid ublk.overlaybd config: remote_io_workers must be > 0");
         }
+        if self
+            .snapshot
+            .memory_startup_pack
+            .posix_ublk_prefetch_enabled
+            && self
+                .snapshot
+                .memory_startup_pack
+                .posix_ublk_prefetch_workers
+                == 0
+        {
+            bail!("snapshot.memory_startup_pack.posix_ublk_prefetch_workers must be > 0");
+        }
         self.validate_memory_snapshot_background_download()?;
         self.validate_overlaybd_global_config_paths()?;
         self.validate_disk_rate_limit()?;
@@ -1485,7 +1501,23 @@ mod tests {
     #[test]
     fn bundled_default_config_loads() -> Result<()> {
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
-        ConfigManager::new_from_path(&workspace.join("config/default.toml"))?;
+        let config = ConfigManager::new_from_path(&workspace.join("config/default.toml"))?;
+        assert_eq!(
+            config
+                .config()
+                .snapshot
+                .memory_startup_pack
+                .posix_ublk_prefetch_workers,
+            4
+        );
+        assert_eq!(
+            config
+                .config()
+                .snapshot
+                .memory_startup_pack
+                .max_prefetch_bytes,
+            0
+        );
         Ok(())
     }
 

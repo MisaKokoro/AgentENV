@@ -9,7 +9,10 @@
 //! best-effort: any failure returns `None` and the publish continues without
 //! a manifest.
 
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -21,7 +24,7 @@ use crate::cfg::ConfigManager;
 use crate::sandbox::ublk::UblkDeviceManager;
 use crate::snapshot::MEMORY_STARTUP_TRACE_ARTIFACT;
 
-const UBLK_PREFETCH_CHUNK_BYTES: usize = 4 << 20;
+const UBLK_PREFETCH_CHUNK_BYTES: usize = 256 << 10;
 
 /// Recording is repository-neutral. Each backend decides how to persist and
 /// consume the resulting manifest.
@@ -34,13 +37,15 @@ fn recording_enabled() -> bool {
 }
 
 /// Warm the block-device page cache for the exact memory ublk device
-/// Firecracker will mmap. The returned future completes after the full
-/// manifest has been read; callers may detach it to overlap prefetch with
-/// restore.
+/// Firecracker will mmap. The returned future completes after all selected
+/// manifest ranges have been read.
 pub(super) async fn prefetch_ublk_startup_pages(
     device_path: &Path,
     pack: &crate::snapshot::ResolvedStartupPack,
+    workers: usize,
+    max_prefetch_bytes: u64,
 ) -> Result<()> {
+    anyhow::ensure!(workers > 0, "ublk startup prefetch workers must be > 0");
     let crate::snapshot::StartupPackLocation::LocalPath(manifest_path) = &pack.location else {
         anyhow::bail!("ublk startup prefetch requires a local manifest");
     };
@@ -64,53 +69,124 @@ pub(super) async fn prefetch_ublk_startup_pages(
         "startup manifest memory size mismatch"
     );
 
-    let device_path = device_path.to_path_buf();
-    let manifest_path = manifest_path.clone();
-    tokio::task::spawn_blocking(move || -> Result<()> {
-        use std::os::unix::fs::FileExt;
+    let spans = Arc::new(limit_prefetch_spans(manifest, max_prefetch_bytes));
+    let worker_count = workers.min(spans.len());
+    let cursor = Arc::new(AtomicUsize::new(0));
+    let mut tasks = Vec::with_capacity(worker_count);
+    for _ in 0..worker_count {
+        let device_path = device_path.to_path_buf();
+        let spans = Arc::clone(&spans);
+        let cursor = Arc::clone(&cursor);
+        tasks.push(tokio::task::spawn_blocking(move || {
+            prefetch_ublk_worker(&device_path, &spans, &cursor)
+        }));
+    }
 
-        let device = std::fs::File::open(&device_path)
-            .with_context(|| format!("open memory ublk device {}", device_path.display()))?;
-        let mut buffer = vec![0u8; UBLK_PREFETCH_CHUNK_BYTES];
-        let mut bytes_read = 0u64;
-        let mut read_count = 0u64;
-        let spans = manifest
-            .prefix_pages
-            .into_iter()
-            .map(|offset| (offset, overlaybd::startup_pack::PACK_PAGE_BYTES))
-            .chain(manifest.ranges);
-        for (start, len) in spans {
-            let mut offset = start;
-            let end = start.checked_add(len).context("startup range overflow")?;
-            while offset < end {
-                let chunk_len =
-                    usize::try_from((end - offset).min(UBLK_PREFETCH_CHUNK_BYTES as u64))?;
-                device
-                    .read_exact_at(&mut buffer[..chunk_len], offset)
-                    .with_context(|| {
-                        format!(
-                            "prefetch memory ublk {} at offset {offset:#x}",
-                            device_path.display()
-                        )
-                    })?;
-                offset += chunk_len as u64;
-                bytes_read += chunk_len as u64;
-                read_count += 1;
+    let mut bytes_read = 0u64;
+    let mut read_count = 0u64;
+    let mut first_error = None;
+    for task in tasks {
+        match task.await {
+            Ok(Ok((worker_bytes, worker_reads))) => {
+                bytes_read += worker_bytes;
+                read_count += worker_reads;
+            }
+            Ok(Err(error)) => {
+                first_error.get_or_insert(error);
+            }
+            Err(error) => {
+                first_error.get_or_insert_with(|| {
+                    anyhow::Error::new(error).context("memory ublk prefetch worker failed to join")
+                });
             }
         }
-        info!(
-            device_path = %device_path.display(),
-            manifest_path = %manifest_path.display(),
-            pages = bytes_read / overlaybd::startup_pack::PACK_PAGE_BYTES,
-            bytes = bytes_read,
-            reads = read_count,
-            "memory ublk startup prefetch complete"
-        );
-        Ok(())
-    })
-    .await
-    .context("memory ublk startup prefetch task failed to join")??;
+    }
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+    info!(
+        device_path = %device_path.display(),
+        manifest_path = %manifest_path.display(),
+        workers = worker_count,
+        ranges = spans.len(),
+        pages = bytes_read / overlaybd::startup_pack::PACK_PAGE_BYTES,
+        bytes = bytes_read,
+        reads = read_count,
+        max_prefetch_bytes,
+        "memory ublk startup prefetch complete"
+    );
     Ok(())
+}
+
+fn limit_prefetch_spans(
+    manifest: overlaybd::startup_manifest::StartupManifest,
+    max_prefetch_bytes: u64,
+) -> Vec<(u64, u64)> {
+    let page_bytes = overlaybd::startup_pack::PACK_PAGE_BYTES;
+    let mut remaining =
+        (max_prefetch_bytes != 0).then_some(max_prefetch_bytes / page_bytes * page_bytes);
+    let spans = manifest
+        .prefix_pages
+        .into_iter()
+        .map(|offset| (offset, page_bytes))
+        .chain(manifest.ranges);
+    let mut limited = Vec::new();
+    for (start, len) in spans {
+        let take = remaining.map_or(len, |bytes| len.min(bytes));
+        if take == 0 {
+            break;
+        }
+        limited.push((start, take));
+        if let Some(bytes) = &mut remaining {
+            *bytes -= take;
+        }
+    }
+    limited
+}
+
+fn prefetch_ublk_worker(
+    device_path: &Path,
+    spans: &[(u64, u64)],
+    cursor: &AtomicUsize,
+) -> Result<(u64, u64)> {
+    use std::os::unix::fs::FileExt;
+
+    let device = std::fs::File::open(device_path)
+        .with_context(|| format!("open memory ublk device {}", device_path.display()))?;
+    // SAFETY: `device` owns a live descriptor and `posix_fadvise` only reads
+    // its scalar arguments. It returns an errno value directly.
+    let ret = unsafe { libc::posix_fadvise(device.as_raw_fd(), 0, 0, libc::POSIX_FADV_RANDOM) };
+    if ret != 0 {
+        return Err(std::io::Error::from_raw_os_error(ret))
+            .context("disable memory ublk prefetch readahead");
+    }
+
+    let mut buffer = vec![0u8; UBLK_PREFETCH_CHUNK_BYTES];
+    let mut bytes_read = 0u64;
+    let mut read_count = 0u64;
+    loop {
+        let index = cursor.fetch_add(1, Ordering::Relaxed);
+        let Some(&(start, len)) = spans.get(index) else {
+            break;
+        };
+        let mut offset = start;
+        let end = start.checked_add(len).context("startup range overflow")?;
+        while offset < end {
+            let chunk_len = usize::try_from((end - offset).min(UBLK_PREFETCH_CHUNK_BYTES as u64))?;
+            device
+                .read_exact_at(&mut buffer[..chunk_len], offset)
+                .with_context(|| {
+                    format!(
+                        "prefetch memory ublk {} at offset {offset:#x}",
+                        device_path.display()
+                    )
+                })?;
+            offset += chunk_len as u64;
+            bytes_read += chunk_len as u64;
+            read_count += 1;
+        }
+    }
+    Ok((bytes_read, read_count))
 }
 
 /// Record the first-touch trace for a just-captured snapshot.
@@ -352,8 +428,27 @@ mod tests {
             mem_virtual_size: manifest.mem_virtual_size,
         };
 
-        prefetch_ublk_startup_pages(&device_path, &pack).await?;
+        prefetch_ublk_startup_pages(&device_path, &pack, 4, 0).await?;
         Ok(())
+    }
+
+    #[test]
+    fn ublk_prefetch_limit_truncates_in_manifest_order() {
+        let page = overlaybd::startup_pack::PACK_PAGE_BYTES;
+        let manifest = overlaybd::startup_manifest::StartupManifest {
+            mem_virtual_size: 16 * page,
+            prefix_pages: vec![0],
+            ranges: vec![(4 * page, 3 * page), (12 * page, 2 * page)],
+        };
+
+        assert_eq!(
+            limit_prefetch_spans(manifest.clone(), 2 * page + page / 2),
+            vec![(0, page), (4 * page, page)]
+        );
+        assert_eq!(
+            limit_prefetch_spans(manifest, 0),
+            vec![(0, page), (4 * page, 3 * page), (12 * page, 2 * page)]
+        );
     }
 
     #[tokio::test]
@@ -396,6 +491,8 @@ mod tests {
                 max_pack_bytes: 1 << 30,
                 consume_enabled: false,
                 posix_ublk_prefetch_enabled: false,
+                posix_ublk_prefetch_workers: 4,
+                max_prefetch_bytes: 0,
                 consume_timeout_secs: 30,
             }
         }

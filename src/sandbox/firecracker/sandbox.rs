@@ -2298,27 +2298,35 @@ impl FirecrackerSandbox {
             let device_path = mem_device.device_path().to_path_buf();
 
             if let Some(pack) = posix_ublk_pack {
-                let ublk_prefetch_spawn_start = Instant::now();
-                let prefetch_device = mem_device.clone();
-                let pack = pack.clone();
-                tokio::spawn(async move {
-                    if let Err(error) = super::startup_pack::prefetch_ublk_startup_pages(
-                        prefetch_device.device_path(),
-                        &pack,
-                    )
-                    .await
-                    {
-                        warn!(
-                            operation,
-                            %error,
-                            "memory ublk startup prefetch failed; continuing on demand"
-                        );
-                    }
-                });
+                let ublk_prefetch_start = Instant::now();
+                let workers = global_config
+                    .snapshot
+                    .memory_startup_pack
+                    .posix_ublk_prefetch_workers;
+                let max_prefetch_bytes = global_config
+                    .snapshot
+                    .memory_startup_pack
+                    .max_prefetch_bytes;
+                let result = super::startup_pack::prefetch_ublk_startup_pages(
+                    &device_path,
+                    pack,
+                    workers,
+                    max_prefetch_bytes,
+                )
+                .await;
+                let success = result.is_ok();
+                if let Err(error) = result {
+                    warn!(
+                        operation,
+                        %error,
+                        "memory ublk startup prefetch failed; continuing on demand"
+                    );
+                }
                 info!(
                     operation,
-                    stage = "ublk_prefetch_spawn",
-                    elapsed_ms = ublk_prefetch_spawn_start.elapsed().as_millis() as u64,
+                    stage = "ublk_prefetch",
+                    elapsed_ms = ublk_prefetch_start.elapsed().as_millis() as u64,
+                    success,
                     "sandbox stage elapsed"
                 );
             }

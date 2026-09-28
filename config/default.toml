@@ -262,10 +262,13 @@ workers = 1
 # record_budget_secs = 10
 # max_pack_bytes = 1073741824
 # consume_enabled = false
-# Experimental POSIX-only mode: synchronously read all manifest ranges from
-# the shared memory /dev/ublkbN before Firecracker restore. This replaces the
-# backing-file page-cache prefetch and is intended to validate cache depth.
+# Experimental POSIX-only mode: synchronously read manifest ranges from the
+# shared memory /dev/ublkbN before Firecracker restore. Reads use bounded
+# blocking workers and disable descriptor-level readahead so only selected
+# ranges are requested. `max_prefetch_bytes = 0` means no logical-byte limit.
 # posix_ublk_prefetch_enabled = false
+# posix_ublk_prefetch_workers = 4
+# max_prefetch_bytes = 0
 # consume_timeout_secs = 30
 
 # POSIX storage defaults under AENV_HOME. Set this for a shared or independent
