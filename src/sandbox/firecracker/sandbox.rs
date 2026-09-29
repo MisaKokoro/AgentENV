@@ -2310,8 +2310,8 @@ impl FirecrackerSandbox {
                     .snapshot
                     .memory_startup_pack
                     .max_prefetch_bytes;
-                let result = super::startup_pack::prefetch_ublk_startup_pages(
-                    &device_path,
+                let result = super::startup_pack::prefetch_shared_ublk_startup_pages(
+                    mem_device.clone(),
                     pack,
                     workers,
                     max_prefetch_bytes,

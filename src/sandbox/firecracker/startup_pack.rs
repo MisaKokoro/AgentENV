@@ -12,7 +12,7 @@
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -21,10 +21,25 @@ use uvm_ublk_daemon::protocol::PackRecordingState;
 
 use super::{FirecrackerSandbox, FirecrackerSnapshotConfig};
 use crate::cfg::ConfigManager;
-use crate::sandbox::ublk::UblkDeviceManager;
+use crate::sandbox::singleflight::Singleflight;
+use crate::sandbox::ublk::{SharedReadOnlyDevice, UblkDeviceManager};
 use crate::snapshot::MEMORY_STARTUP_TRACE_ARTIFACT;
 
 const UBLK_PREFETCH_CHUNK_BYTES: usize = 256 << 10;
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct UblkPrefetchKey {
+    dev_id: u32,
+    manifest_sha256: String,
+    manifest_size: u64,
+    mem_virtual_size: u64,
+    max_prefetch_bytes: u64,
+}
+
+fn ublk_prefetch_singleflight() -> &'static Singleflight<UblkPrefetchKey, ()> {
+    static FLIGHTS: OnceLock<Singleflight<UblkPrefetchKey, ()>> = OnceLock::new();
+    FLIGHTS.get_or_init(Singleflight::default)
+}
 
 /// Recording is repository-neutral. Each backend decides how to persist and
 /// consume the resulting manifest.
@@ -39,6 +54,42 @@ pub(super) fn record_until_envd_ready_for(config: &crate::cfg::SnapshotConfig) -
 
 fn recording_enabled() -> bool {
     recording_enabled_for(&ConfigManager::global_config().snapshot)
+}
+
+/// Coalesce identical prefetches only while they are running. The spawned
+/// operation owns a device handle so cancellation of the leader sandbox does
+/// not release the shared ublk or strand its waiters.
+pub(super) async fn prefetch_shared_ublk_startup_pages(
+    device: SharedReadOnlyDevice,
+    pack: &crate::snapshot::ResolvedStartupPack,
+    workers: usize,
+    max_prefetch_bytes: u64,
+) -> Result<()> {
+    let key = UblkPrefetchKey {
+        dev_id: device.dev_id(),
+        manifest_sha256: pack.index_sha256.clone(),
+        manifest_size: pack.pack_size,
+        mem_virtual_size: pack.mem_virtual_size,
+        max_prefetch_bytes,
+    };
+    let device_path = device.device_path().to_path_buf();
+    let owned_pack = pack.clone();
+    let dev_id = device.dev_id();
+    let manifest_sha256 = pack.index_sha256.clone();
+    let outcome = ublk_prefetch_singleflight()
+        .run(key, move || async move {
+            let _device_guard = device;
+            prefetch_ublk_startup_pages(&device_path, &owned_pack, workers, max_prefetch_bytes)
+                .await
+        })
+        .await?;
+    debug!(
+        dev_id,
+        manifest_sha256,
+        leader = outcome.leader,
+        "memory ublk startup prefetch singleflight completed"
+    );
+    Ok(())
 }
 
 /// Warm the block-device page cache for the exact memory ublk device

@@ -9,6 +9,7 @@ pub mod manifest;
 pub(crate) mod mock;
 mod network;
 mod process;
+mod singleflight;
 mod ublk;
 
 use std::{collections::HashMap, path::PathBuf};

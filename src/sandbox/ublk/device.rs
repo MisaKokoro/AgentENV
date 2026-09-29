@@ -18,6 +18,7 @@ use uvm_ublk_daemon::{
 
 use super::overlaybd::OverlaybdConfig;
 use crate::observability::prometheus::MetricGuard;
+use crate::sandbox::singleflight::Singleflight;
 use crate::sandbox::SandboxCaptureError;
 
 const UBLK_OPERATION_DURATION: &str = "agentenv_ublk_operation_duration_seconds";
@@ -170,6 +171,13 @@ fn runtime_device_timeout(resize_timeout_secs: u64) -> Duration {
     RUNTIME_DEVICE_TIMEOUT.max(resize_timeout)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct SharedReadOnlyCreateKey {
+    image_config: PathBuf,
+    global_config: PathBuf,
+    virtual_size: Option<u64>,
+}
+
 /// Global ublk device manager.
 ///
 /// Wraps the daemon client for device lifecycle management. Device IDs are
@@ -188,6 +196,8 @@ pub struct UblkDeviceManager {
     /// Values are `Weak` references: when the last `SharedReadOnlyDevice` handle is
     /// dropped, the device is deleted asynchronously and the entry becomes stale.
     shared_readonly_devices: DashMap<PathBuf, Weak<SharedReadOnlyDeviceInner>>,
+    /// Coalesces concurrent cache misses before they create candidate devices.
+    shared_readonly_creates: Singleflight<SharedReadOnlyCreateKey, SharedReadOnlyDevice>,
     /// Per-image notifications for asynchronous shared-memory releases. A new
     /// acquire for the same image waits until the previous last-handle release
     /// has completed so the daemon does not reuse stale opened image state.
@@ -203,6 +213,7 @@ impl UblkDeviceManager {
             client,
             pool_enabled,
             shared_readonly_devices: DashMap::new(),
+            shared_readonly_creates: Singleflight::default(),
             shared_readonly_releases: DashMap::new(),
             recent_tools_device: std::sync::Mutex::new(None),
         }
@@ -626,14 +637,67 @@ impl UblkDeviceManager {
             global_config,
         } = spec;
 
-        let key = std::fs::canonicalize(image_config).unwrap_or_else(|_| image_config.clone());
+        let image_key =
+            std::fs::canonicalize(image_config).unwrap_or_else(|_| image_config.clone());
+        if let Some(device) = self.existing_shared_readonly(&image_key) {
+            return Ok(device);
+        }
+
+        let create_key = SharedReadOnlyCreateKey {
+            image_config: image_key.clone(),
+            global_config: std::fs::canonicalize(global_config)
+                .unwrap_or_else(|_| global_config.clone()),
+            virtual_size,
+        };
+        let owned_spec = spec.clone();
+        let outcome = self
+            .shared_readonly_creates
+            .run(create_key, move || async move {
+                UblkDeviceManager::global()
+                    .create_shared_readonly(owned_spec, image_key, virtual_size)
+                    .await
+            })
+            .await?;
+        if !outcome.leader {
+            debug!(
+                dev_id = outcome.value.inner.device.dev_id,
+                "shared read-only ublk creation joined in-flight request"
+            );
+        }
+        Ok(outcome.value)
+    }
+
+    fn existing_shared_readonly(&self, key: &Path) -> Option<SharedReadOnlyDevice> {
+        let strong = self
+            .shared_readonly_devices
+            .get(key)?
+            .upgrade()
+            .filter(|inner| !inner.released.load(Ordering::Acquire))?;
+        debug!(
+            key = %key.display(),
+            dev_id = strong.device.dev_id,
+            "reusing shared read-only ublk device"
+        );
+        Some(SharedReadOnlyDevice { inner: strong })
+    }
+
+    async fn create_shared_readonly(
+        &self,
+        spec: UblkCreateSpec,
+        image_key: PathBuf,
+        virtual_size: Option<u64>,
+    ) -> Result<SharedReadOnlyDevice> {
+        let UblkCreateSpec::Overlaybd {
+            image_config,
+            global_config,
+        } = &spec;
 
         loop {
             // If the previous last handle is still releasing the daemon-side
             // shared device, wait before acquiring the same key again.
             if let Some(notify) = self
                 .shared_readonly_releases
-                .get(&key)
+                .get(&image_key)
                 .map(|entry| Arc::clone(entry.value()))
             {
                 let notified = notify.notified();
@@ -641,7 +705,7 @@ impl UblkDeviceManager {
                 notified.as_mut().enable();
                 if self
                     .shared_readonly_releases
-                    .get(&key)
+                    .get(&image_key)
                     .is_some_and(|current| Arc::ptr_eq(current.value(), &notify))
                 {
                     notified.await;
@@ -649,19 +713,8 @@ impl UblkDeviceManager {
                 continue;
             }
 
-            // Fast path: try to upgrade an existing Weak reference.
-            if let Some(weak) = self.shared_readonly_devices.get(&key) {
-                if let Some(strong) = weak
-                    .upgrade()
-                    .filter(|inner| !inner.released.load(Ordering::Acquire))
-                {
-                    debug!(
-                        key = %key.display(),
-                        dev_id = strong.device.dev_id,
-                        "reusing shared read-only ublk device"
-                    );
-                    return Ok(SharedReadOnlyDevice { inner: strong });
-                }
+            if let Some(device) = self.existing_shared_readonly(&image_key) {
+                return Ok(device);
             }
             break;
         }
@@ -687,7 +740,7 @@ impl UblkDeviceManager {
                 device_path,
             }
         } else {
-            self.create_raw_overlaybd_device(spec)
+            self.create_raw_overlaybd_device(&spec)
                 .await
                 .context("create shared read-only ublk device")?
         };
@@ -700,7 +753,7 @@ impl UblkDeviceManager {
             }
         };
         info!(
-            key = %key.display(),
+            key = %image_key.display(),
             dev_id = device.dev_id,
             path = %device.device_path.display(),
             "created or acquired shared read-only ublk device"
@@ -708,7 +761,7 @@ impl UblkDeviceManager {
 
         let inner = Arc::new(SharedReadOnlyDeviceInner {
             device,
-            image_config_key: key.clone(),
+            image_config_key: image_key.clone(),
             released: AtomicBool::new(false),
             cache_fd: std::sync::Mutex::new(Some(cache_fd)),
         });
@@ -717,7 +770,7 @@ impl UblkDeviceManager {
         // concurrent caller that won the race.
         let mut entry = self
             .shared_readonly_devices
-            .entry(key)
+            .entry(image_key)
             .or_insert_with(|| Arc::downgrade(&inner));
         if let Some(winner) = entry
             .upgrade()
@@ -850,6 +903,10 @@ pub(crate) struct SharedReadOnlyDevice {
 }
 
 impl SharedReadOnlyDevice {
+    pub fn dev_id(&self) -> u32 {
+        self.inner.device.dev_id()
+    }
+
     pub fn image_config_path(&self) -> &Path {
         &self.inner.image_config_key
     }
