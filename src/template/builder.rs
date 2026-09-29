@@ -1,4 +1,5 @@
-use std::path::Path;
+use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use anyhow::Error as AnyhowError;
@@ -19,6 +20,19 @@ use crate::snapshot::{
     SnapshotPublishSource, SnapshotRecord, StartupCommand, TemplateBuildErrorReason,
 };
 use crate::types::SandboxResources;
+
+/// Tie a template startup recording to its temporary build workspace. Both
+/// the recorder task and the detached repository continuation receive a lease,
+/// so either can safely outlive synchronous publication.
+fn spawn_template_startup_recording<F>(
+    recorder: F,
+    workspace: Arc<TempDir>,
+) -> crate::snapshot::StartupRecording
+where
+    F: Future<Output = Option<PathBuf>> + Send + 'static,
+{
+    crate::snapshot::StartupRecording::spawn_with_capture_lease(recorder, workspace)
+}
 
 #[derive(Clone)]
 /// Coordinates template-builder flows over committed snapshots.
@@ -121,6 +135,7 @@ impl TemplateBuilder {
                 .into());
             }
         };
+        let workspace_lease = Arc::new(context.workspace);
         let mut resources = context.resources;
         resources.disk_size_mib = build_execution
             .manifest
@@ -143,12 +158,14 @@ impl TemplateBuilder {
                     .downcast::<crate::sandbox::FirecrackerSnapshotConfig>()
                     .ok()
             })
-            .map(|snapshot_config| crate::snapshot::StartupRecording {
-                trace: tokio::spawn(crate::sandbox::record_startup_pack(
-                    *snapshot_config,
-                    build_execution.output_dir.clone(),
-                )),
-                keep_alive: Box::new(()),
+            .map(|snapshot_config| {
+                spawn_template_startup_recording(
+                    crate::sandbox::record_startup_pack(
+                        *snapshot_config,
+                        build_execution.output_dir.clone(),
+                    ),
+                    Arc::clone(&workspace_lease),
+                )
             });
         let record = snapshot_manager
             .publish(
@@ -456,6 +473,39 @@ mod tests {
         );
         drop(context);
         assert!(!workspace.exists());
+    }
+
+    #[tokio::test]
+    async fn startup_recording_retains_template_workspace_until_continuation_finishes() {
+        let workspace = Arc::new(TempDir::new().expect("tempdir"));
+        let workspace_path = workspace.path().to_path_buf();
+        let trace_path = workspace_path.join(crate::snapshot::MEMORY_STARTUP_TRACE_ARTIFACT);
+        let task_trace_path = trace_path.clone();
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let recording = spawn_template_startup_recording(
+            async move {
+                let _ = wait.await;
+                tokio::fs::write(&task_trace_path, b"trace")
+                    .await
+                    .expect("workspace must remain writable");
+                Some(task_trace_path)
+            },
+            Arc::clone(&workspace),
+        );
+
+        drop(workspace);
+        assert!(workspace_path.exists());
+        let crate::snapshot::StartupRecording { trace, keep_alive } = recording;
+        release.send(()).expect("recording task running");
+        assert_eq!(
+            trace.await.expect("recording task"),
+            Some(trace_path.clone())
+        );
+        assert_eq!(tokio::fs::read(trace_path).await.expect("trace"), b"trace");
+        assert!(workspace_path.exists());
+
+        drop(keep_alive);
+        assert!(!workspace_path.exists());
     }
 
     #[tokio::test]

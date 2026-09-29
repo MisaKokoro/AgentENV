@@ -20,8 +20,8 @@ pub const MEMORY_STARTUP_TRACE_ARTIFACT: &str = "memory-startup.trace";
 pub struct StartupRecording {
     /// Completes with the trace path on success, `None` on any failure.
     pub trace: tokio::task::JoinHandle<Option<std::path::PathBuf>>,
-    /// Opaque hold-only lease (the capture root guard for sandbox captures;
-    /// a unit placeholder for template builds).
+    /// Opaque hold-only lease (the capture root guard for sandbox captures or
+    /// the temporary workspace for template builds).
     pub keep_alive: Box<dyn std::any::Any + Send>,
 }
 
